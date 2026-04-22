@@ -1,0 +1,25 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Website {
+  id        String   @id @default(uuid())
+  url       String   @unique
+  label     String?
+  createdAt DateTime @default(now())
+  scans     ScanResult[]
+  @@map("websites")
+}
+
+model ScanResult {
+  id               String   @id @default(uuid())
+  websiteId        String
+  cms              String?  // "WordPress", null
+  version          String?  // "6.4.2", null
+  confidence       Int      @default(0)
+  detectionMethods String[]
+  scannedAt        DateTime @default(now())
+  website Website @relation(fields: [websiteId], references: [id])
+  @@map("scan_results")
+}
