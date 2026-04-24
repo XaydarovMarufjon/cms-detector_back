@@ -2,8 +2,8 @@ import { IsString, IsUrl, IsUUID } from 'class-validator';
 
 export class ScanWebsiteDto {
     @IsUUID()
-    websiteId: string;
+    websiteId!: string;
 
     @IsUrl()          // URL formatini tekshiradi
-    url: string;
+    url!: string;
 }

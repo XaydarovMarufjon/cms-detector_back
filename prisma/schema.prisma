@@ -1,25 +1,39 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "darwin", "darwin-arm64", "windows", "debian-openssl-1.1.x"]
+}
+
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
 model Website {
-  id        String   @id @default(uuid())
-  url       String   @unique
+  id        String       @id @default(uuid())
+  url       String       @unique
   label     String?
-  createdAt DateTime @default(now())
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
   scans     ScanResult[]
+
   @@map("websites")
 }
 
 model ScanResult {
   id               String   @id @default(uuid())
   websiteId        String
-  cms              String?  // "WordPress", null
-  version          String?  // "6.4.2", null
+  cms              String?
+  version          String?
+  category         String? // "CMS" | "Framework" | "Headless" | "Static" | "Custom" | "Unknown"
   confidence       Int      @default(0)
   detectionMethods String[]
+  serverTech       String[] // ["Nginx", "PHP/8.1"]
+  jsFrameworks     String[] // ["React", "Vue"]
+  rawSignals       Json     @default("{}")
   scannedAt        DateTime @default(now())
-  website Website @relation(fields: [websiteId], references: [id])
+  errorMessage     String?
+  website          Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId])
   @@map("scan_results")
 }

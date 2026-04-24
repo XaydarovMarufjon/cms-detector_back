@@ -1,4 +1,4 @@
 import { PartialType } from '@nestjs/mapped-types';
-import { CreateScannerDto } from './scan.dto';
+import { ScanWebsiteDto } from './scan.dto';
 
-export class UpdateScannerDto extends PartialType(CreateScannerDto) { }
+export class UpdateScannerDto extends PartialType(ScanWebsiteDto) { }
