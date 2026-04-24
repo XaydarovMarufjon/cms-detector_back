@@ -16,6 +16,6 @@ async function bootstrap() {
     transform: true,    // Turlarni avtomatik konvertatsiya qiladi
   }));
   await app.listen(3000, '0.0.0.0');
-  console.log('🚀 http://localhost:3000/api');
+  console.log('🚀 http://localhost:3000/api' );
 }
 bootstrap();
