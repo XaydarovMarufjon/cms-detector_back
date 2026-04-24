@@ -15,7 +15,7 @@ async function bootstrap() {
     whitelist: true,    // DTO da yo'q maydonlarni o'chiradi
     transform: true,    // Turlarni avtomatik konvertatsiya qiladi
   }));
-  await app.listen(process.env.PORT ?? 3000);
+  await app.listen(3000, '0.0.0.0');
   console.log('🚀 http://localhost:3000/api');
 }
 bootstrap();
