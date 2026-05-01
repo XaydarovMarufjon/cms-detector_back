@@ -1,9 +1,10 @@
 // src/scanner/scanner.controller.ts
 import {
   Controller, Get, Post, Delete, Patch,
-  Param, Body, HttpCode, UseGuards,
+  Param, Body, Query, HttpCode, UseGuards,
 } from '@nestjs/common';
 import { ScannerService } from './scanner.service';
+import { SubdomainService } from './subdomain.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
@@ -13,13 +14,22 @@ import { Roles } from '../auth/decorators/roles.decorator';
 @UseGuards(JwtAuthGuard, RolesGuard)
 export class ScannerController {
   constructor(
-    private readonly scanner: ScannerService,
-    private readonly prisma:  PrismaService,
+    private readonly scanner:    ScannerService,
+    private readonly subdomains: SubdomainService,
+    private readonly prisma:     PrismaService,
   ) {}
 
   // ── Hamma ko'ra oladi ────────────────────────────
   @Get('results')
   getResults() { return this.scanner.getLatestResults(); }
+
+  @Get('can-embed')
+  canEmbed(@Query('url') url: string) { return this.scanner.checkCanEmbed(url); }
+
+  @Get('subdomains')
+  discoverSubdomains(@Query('domain') domain: string) {
+    return this.subdomains.discover(domain);
+  }
 
   @Get('websites')
   getAllWebsites() {

@@ -4,13 +4,14 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { ScannerController } from './scanner.controller';
 import { ScannerService } from './scanner.service';
 import { CmsDetectorService } from './cms-detector.service';
+import { SubdomainService } from './subdomain.service';
 
 @Module({
   imports: [
-    PrismaModule,           // DB kerak
-    ScheduleModule.forRoot(), // Cron kerak
+    PrismaModule,
+    ScheduleModule.forRoot(),
   ],
-  controllers: [ScannerController], // HTTP endpoint lar
-  providers: [ScannerService, CmsDetectorService], // Logika
+  controllers: [ScannerController],
+  providers: [ScannerService, CmsDetectorService, SubdomainService],
 })
 export class ScannerModule { }

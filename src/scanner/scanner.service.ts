@@ -2,6 +2,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import { CronJob } from 'cron';
+import axios from 'axios';
 import { PrismaService } from '../prisma/prisma.service';
 import { CmsDetectorService } from './cms-detector.service';
 import pLimit from 'p-limit';
@@ -98,6 +99,7 @@ export class ScannerService {
           jsFrameworks: result.jsFrameworks,
           rawSignals: result.rawSignals,
           httpStatus: result.httpStatus,
+          pageTitle: result.pageTitle,
         },
       });
     } catch (err) {
@@ -113,6 +115,28 @@ export class ScannerService {
           errorMessage: message,
         },
       });
+    }
+  }
+
+  // ── CAN EMBED ─────────────────────────────────────────────────────────────
+  async checkCanEmbed(url: string): Promise<{ canEmbed: boolean }> {
+    try {
+      const res = await axios.head(url, {
+        timeout: 8000,
+        maxRedirects: 5,
+        validateStatus: () => true,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      });
+      const xfo = (res.headers['x-frame-options'] || '').toLowerCase().trim();
+      const csp = res.headers['content-security-policy'] || '';
+      const blocked =
+        xfo === 'deny' ||
+        xfo === 'sameorigin' ||
+        /frame-ancestors\s+['"]?none['"]?/i.test(csp) ||
+        /frame-ancestors\s+['"]?self['"]?/i.test(csp);
+      return { canEmbed: !blocked };
+    } catch {
+      return { canEmbed: false };
     }
   }
 

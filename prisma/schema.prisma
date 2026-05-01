@@ -47,6 +47,7 @@ model ScanResult {
   jsFrameworks     String[] // ["React", "Vue"]
   rawSignals       Json     @default("{}")
   httpStatus       Int?
+  pageTitle        String?
   scannedAt        DateTime @default(now())
   errorMessage     String?
   website          Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
