@@ -1,0 +1,17 @@
+ this.logger.warn(`Detection failed for ${url}: ${String(err)}`);
+
+
+   catch (err) {
+      let message = 'Unknown error';
+
+      if (err instanceof Error) {
+        message = err.message;
+      }
+
+      return this.prisma.scanResult.create({
+        data: {
+          websiteId,
+          errorMessage: message,
+        },
+      });
+    }

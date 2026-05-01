@@ -1,79 +1,71 @@
+// src/scanner/scanner.controller.ts
 import {
-  Controller, Get, Post,
-  Param, Body, HttpCode,
-  Delete, Patch
+  Controller, Get, Post, Delete, Patch,
+  Param, Body, HttpCode, UseGuards,
 } from '@nestjs/common';
 import { ScannerService } from './scanner.service';
-import { ScanWebsiteDto } from './dto/scan.dto';
-import { PrismaService } from 'src/prisma/prisma.service';
+import { PrismaService } from '../prisma/prisma.service';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
 
-@Controller('scanner') // Barcha route lar /scanner/ bilan boshlanadi
+@Controller('scanner')
+@UseGuards(JwtAuthGuard, RolesGuard)
 export class ScannerController {
   constructor(
     private readonly scanner: ScannerService,
-    private readonly prisma: PrismaService) { }
+    private readonly prisma:  PrismaService,
+  ) {}
 
-  // GET /scanner/results
+  // ── Hamma ko'ra oladi ────────────────────────────
   @Get('results')
-  getResults() {
-    return this.scanner.getLatestResults();
-  }
-
-  // POST /scanner/scan
-  // Body: { "websiteId": "uuid", "url": "https://..." }
-  @Post('scan')
-  @HttpCode(200)
-  scanOne(@Body() dto: ScanWebsiteDto) {
-    return this.scanner.scanOne(dto.websiteId, dto.url);
-  }
-
-  // POST /scanner/scan-all — barcha saytlarni skanerlash
-  @Post('scan-all')
-  @HttpCode(200)
-  scanAll() {
-    return this.scanner.scanAll();
-  }
+  getResults() { return this.scanner.getLatestResults(); }
 
   @Get('websites')
   getAllWebsites() {
-    return this.prisma.website.findMany({
-      orderBy: { createdAt: 'desc' },
-    });
+    return this.prisma.website.findMany({ orderBy: { createdAt: 'desc' } });
   }
+
+  // ── Interval sozlash ─────────────────────────────
+  @Get('interval')
+  getInterval() { return this.scanner.getInterval(); }
+
+  @Post('interval')
+  @Roles('ADMIN')
+  setInterval(@Body() body: { minutes: number }) {
+    return this.scanner.setInterval(body.minutes);
+  }
+
+  // ── ADMIN va WORKER ──────────────────────────────
+  @Post('scan')
+  @Roles('ADMIN', 'WORKER')
+  @HttpCode(200)
+  scanOne(@Body() body: { websiteId: string; url: string }) {
+    return this.scanner.scanOne(body.websiteId, body.url);
+  }
+
+  @Post('scan-all')
+  @Roles('ADMIN', 'WORKER')
+  @HttpCode(200)
+  scanAll() { return this.scanner.scanAll(); }
 
   @Post('websites')
+  @Roles('ADMIN', 'WORKER')
   createWebsite(@Body() body: { url: string; label?: string }) {
-    return this.prisma.website.create({
-      data: { url: body.url, label: body.label },
-    });
+    return this.prisma.website.create({ data: { url: body.url, label: body.label } });
   }
-
-  @Delete('websites/:id')
-  async deleteWebsite(@Param('id') id: string) {
-    // Avval scan natijalarini o'chirish
-    await this.prisma.scanResult.deleteMany({
-      where: { websiteId: id },
-    });
-
-    // Keyin saytni o'chirish
-    return this.prisma.website.delete({
-      where: { id },
-    });
-  }
-
 
   @Patch('websites/:id')
-  async updateWebsite(
-    @Param('id') id: string,
-    @Body() body: { url?: string; label?: string }
-  ) {
-    return this.prisma.website.update({
-      where: { id },
-      data: {
-        url: body.url,
-        label: body.label,
-      },
-    });
+  @Roles('ADMIN', 'WORKER')
+  updateWebsite(@Param('id') id: string, @Body() body: { url?: string; label?: string }) {
+    return this.prisma.website.update({ where: { id }, data: body });
   }
 
+  // ── Faqat ADMIN ──────────────────────────────────
+  @Delete('websites/:id')
+  @Roles('ADMIN')
+  async deleteWebsite(@Param('id') id: string) {
+    await this.prisma.scanResult.deleteMany({ where: { websiteId: id } });
+    return this.prisma.website.delete({ where: { id } });
+  }
 }
