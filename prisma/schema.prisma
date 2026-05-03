@@ -35,6 +35,20 @@ model Website {
   @@map("websites")
 }
 
+model Alert {
+  id          String   @id @default(uuid())
+  domain      String
+  websiteId   String?
+  type        String   // 'expiry_critical' | 'expiry_warning' | 'expiry_notice'
+  message     String
+  dueDate     DateTime
+  dismissed   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@unique([domain, type])
+  @@map("alerts")
+}
+
 model ScanResult {
   id               String   @id @default(uuid())
   websiteId        String

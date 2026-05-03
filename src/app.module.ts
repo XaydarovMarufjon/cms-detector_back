@@ -5,13 +5,15 @@ import { ScannerModule } from './scanner/scanner.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
+import { AlertsModule } from './alerts/alerts.module';
 
 @Module({
-  imports: [ScannerModule,
+  imports: [
     PrismaModule,
     AuthModule,
     UsersModule,
-    ScannerModule
+    ScannerModule,
+    AlertsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

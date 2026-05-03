@@ -5,10 +5,13 @@ import {
 } from '@nestjs/common';
 import { ScannerService } from './scanner.service';
 import { SubdomainService } from './subdomain.service';
+import { WhoisService } from './whois.service';
+import { SiteInfoService } from './site-info.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { Public } from '../auth/decorators/public.decorator';
 
 @Controller('scanner')
 @UseGuards(JwtAuthGuard, RolesGuard)
@@ -16,6 +19,8 @@ export class ScannerController {
   constructor(
     private readonly scanner:    ScannerService,
     private readonly subdomains: SubdomainService,
+    private readonly whois:      WhoisService,
+    private readonly siteInfo:   SiteInfoService,
     private readonly prisma:     PrismaService,
   ) {}
 
@@ -25,6 +30,16 @@ export class ScannerController {
 
   @Get('can-embed')
   canEmbed(@Query('url') url: string) { return this.scanner.checkCanEmbed(url); }
+
+  @Public()
+  @Get('whois')
+  getWhois(@Query('domain') domain: string) { return this.whois.lookup(domain); }
+
+  @Public()
+  @Get('site-info')
+  getSiteInfo(@Query('url') url: string, @Query('websiteId') websiteId?: string) {
+    return this.siteInfo.analyze(url, websiteId);
+  }
 
   @Get('subdomains')
   discoverSubdomains(@Query('domain') domain: string) {
