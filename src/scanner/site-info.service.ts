@@ -55,11 +55,17 @@ const SEC_HEADERS: { key: string; name: string; points: number }[] = [
 
 @Injectable()
 export class SiteInfoService {
+  private readonly cache = new Map<string, { data: SiteInfoData; exp: number }>();
+  private readonly TTL = 60 * 60 * 1000; // 1h
+
   constructor(private readonly alertsService: AlertsService) {}
 
   async analyze(url: string, websiteId?: string): Promise<SiteInfoData> {
     const hostname = this.extractHost(url);
     if (!hostname) return { ssl: null, geo: null, headers: null };
+
+    const cached = this.cache.get(hostname);
+    if (cached && Date.now() < cached.exp) return cached.data;
 
     const [ssl, headersRaw, geo] = await Promise.all([
       this.checkSsl(hostname),
@@ -74,7 +80,9 @@ export class SiteInfoService {
       this.alertsService.checkSslExpiry(hostname, ssl.daysLeft, ssl.validTo, websiteId).catch(() => {});
     }
 
-    return { ssl, geo, headers };
+    const result: SiteInfoData = { ssl, geo, headers };
+    this.cache.set(hostname, { data: result, exp: Date.now() + this.TTL });
+    return result;
   }
 
   // ── SSL ──────────────────────────────────────────────────────────────────

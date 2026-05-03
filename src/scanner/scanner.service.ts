@@ -5,7 +5,10 @@ import { CronJob } from 'cron';
 import axios from 'axios';
 import { PrismaService } from '../prisma/prisma.service';
 import { CmsDetectorService } from './cms-detector.service';
+import { WhoisService } from './whois.service';
+import { SiteInfoService } from './site-info.service';
 import pLimit from 'p-limit';
+
 @Injectable()
 export class ScannerService {
   private readonly logger = new Logger(ScannerService.name);
@@ -15,8 +18,11 @@ export class ScannerService {
     private readonly prisma: PrismaService,
     private readonly detector: CmsDetectorService,
     private readonly scheduler: SchedulerRegistry,
+    private readonly whois: WhoisService,
+    private readonly siteInfo: SiteInfoService,
   ) {
     this.startDefaultJob();
+    this.startExpiryCheckJob();
   }
 
   // ── DEFAULT CRON ─────────────────────────────────────────────────────────
@@ -67,6 +73,49 @@ export class ScannerService {
 
   getInterval() {
     return { interval: this.currentInterval };
+  }
+
+  // ── EXPIRY CHECK CRON (har kuni soat 02:00) ──────────────────────────────
+  private startExpiryCheckJob() {
+    const job = new CronJob('0 0 2 * * *', () => {
+      this.logger.log('Expiry check started (daily 02:00)');
+      this.checkExpiryAll().catch(e => this.logger.error('Expiry check failed', e));
+    });
+    this.scheduler.addCronJob('expiry-check', job);
+    job.start();
+    this.logger.log('✅ Expiry check job started: every day at 02:00');
+  }
+
+  async checkExpiryAll() {
+    const sites = await this.prisma.website.findMany();
+    const limit = pLimit(3); // sekin — tashqi API rate limit uchun
+
+    await Promise.all(
+      sites.map(site =>
+        limit(async () => {
+          try {
+            // SSL + GEO + Headers (cache dan foydalanadi)
+            await this.siteInfo.analyze(site.url, site.id);
+          } catch { /* silent */ }
+
+          // WHOIS faqat .uz domenlar uchun
+          const host = site.url
+            .replace(/^https?:\/\//, '')
+            .split('/')[0]
+            .replace(/^www\./, '');
+          if (host.endsWith('.uz')) {
+            try {
+              await this.whois.lookup(site.url, site.id);
+            } catch { /* silent */ }
+          }
+
+          // Har so'rov orasida 1.5 sekund kutish (ip-api.com: 45 req/min)
+          await new Promise(r => setTimeout(r, 1500));
+        })
+      )
+    );
+
+    this.logger.log(`Expiry check done: ${sites.length} sites checked`);
   }
 
   // ── SCAN ALL ──────────────────────────────────────────────────────────────

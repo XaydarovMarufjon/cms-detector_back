@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosResponse } from 'axios';
 import * as cheerio from 'cheerio';
+import * as http from 'http';
+import * as https from 'https';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 
@@ -56,6 +58,12 @@ export class CmsDetectorService {
     private readonly proxies: string[] = (process.env['PROXY_LIST'] || '')
         .split(',').map(p => p.trim()).filter(Boolean);
     private proxyIndex = 0;
+
+    private readonly httpAgent  = new http.Agent({  keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 30_000 });
+    private readonly httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 30_000, rejectUnauthorized: false });
+
+    private readonly detectCache = new Map<string, { result: CmsDetectionResult; exp: number }>();
+    private readonly DETECT_TTL = 30 * 60 * 1000; // 30 min
 
     private getNextAgent(): any {
         if (!this.proxies.length) return undefined;
@@ -757,6 +765,13 @@ export class CmsDetectorService {
     // ── MAIN ─────────────────────────────────────────────────────────────────
     async detect(url: string): Promise<CmsDetectionResult> {
         const baseUrl = this.normalizeUrl(url);
+
+        // Cache hit → return early (refresh detectedAt)
+        const cached = this.detectCache.get(baseUrl);
+        if (cached && Date.now() < cached.exp) {
+            return { ...cached.result, detectedAt: new Date() };
+        }
+
         const signals: TechSignal[] = [];
         const rawSignals: Record<string, string> = {};
         let serverTech: string[] = [];
@@ -804,13 +819,32 @@ export class CmsDetectorService {
             if (robots?.html) signals.push(...this.checkRobotsTxt(robots.html, rawSignals));
             if (sitemap?.html) signals.push(...this.checkSitemap(sitemap.html, rawSignals));
 
-            signals.push(...await this.checkCmsFileProbes(baseUrl, rawSignals));
+            // Smart file probes: skip if meta generator already gave high-conf answer,
+            // else only probe top-3 CMS candidates from prior signals (full sweep if no candidates).
+            const metaWin = signals.some(s => s.method === 'meta generator' && s.confidence >= 90);
+            if (!metaWin) {
+                const tally: Record<string, number> = {};
+                for (const s of signals) {
+                    if (s.category === 'CMS') tally[s.name] = Math.max(tally[s.name] ?? 0, s.confidence);
+                }
+                const candidates = Object.entries(tally)
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, 3)
+                    .map(([name]) => name);
+                signals.push(...await this.checkCmsFileProbes(baseUrl, rawSignals, candidates));
+            }
 
         } catch (err) {
             this.logger.warn(`Detection failed for ${url}: ${String(err)}`);
         }
 
-        return this.resolveResult(baseUrl, signals, rawSignals, serverTech, jsFrameworks, httpStatus, pageTitle, mainPage_result?.html ?? '', mainPage_result?.headers ?? {});
+        const result = this.resolveResult(baseUrl, signals, rawSignals, serverTech, jsFrameworks, httpStatus, pageTitle, mainPage_result?.html ?? '', mainPage_result?.headers ?? {});
+
+        // Cache only successful (non-empty) detections
+        if (result.cms || serverTech.length || jsFrameworks.length) {
+            this.detectCache.set(baseUrl, { result, exp: Date.now() + this.DETECT_TTL });
+        }
+        return result;
     }
 
     // ── HTML COMMENT PARSING ──────────────────────────────────────────────────
@@ -1108,9 +1142,12 @@ export class CmsDetectorService {
     }
 
     // ── FILE PROBES ───────────────────────────────────────────────────────────
-    private async checkCmsFileProbes(baseUrl: string, raw: Record<string, string>): Promise<TechSignal[]> {
+    private async checkCmsFileProbes(baseUrl: string, raw: Record<string, string>, candidates?: string[]): Promise<TechSignal[]> {
+        const cmsList = candidates && candidates.length
+            ? this.CMS_PATTERNS.filter(c => candidates.includes(c.name))
+            : this.CMS_PATTERNS;
         const probes: Array<{ path: string; name: string; extractor: (b: string) => string | null }> = [];
-        for (const cms of this.CMS_PATTERNS) {
+        for (const cms of cmsList) {
             for (const fp of cms.fileProbes || []) {
                 probes.push({ path: fp.path, name: cms.name, extractor: fp.extractor });
             }
@@ -1334,18 +1371,27 @@ export class CmsDetectorService {
     }
 
     // ── FETCH PAGE ────────────────────────────────────────────────────────────
-    private async fetchPage(url: string): Promise<{ html: string; headers: Record<string, string>; status: number } | null> {
-        const agent = this.getNextAgent();
+    private async fetchPage(
+        url: string,
+        retried = false,
+    ): Promise<{ html: string; headers: Record<string, string>; status: number } | null> {
+        const proxyAgent = this.getNextAgent();
         try {
             const res: AxiosResponse = await axios.get(url, {
-                timeout: 12000,
+                timeout: 12_000,
                 maxRedirects: 5,
-                ...(agent ? { httpAgent: agent, httpsAgent: agent } : {}),
+                maxContentLength: 2 * 1024 * 1024,   // 2 MB cap — block bloated pages
+                maxBodyLength: 2 * 1024 * 1024,
+                decompress: true,
+                responseType: 'text',
+                transitional: { silentJSONParsing: true, forcedJSONParsing: false },
+                httpAgent:  proxyAgent ?? this.httpAgent,
+                httpsAgent: proxyAgent ?? this.httpsAgent,
                 headers: {
                     'User-Agent': this.randomUserAgent(),
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                     'Accept-Language': 'uz-UZ,uz;q=0.9,en-US;q=0.8,en;q=0.7,ru;q=0.6',
-                    'Accept-Encoding': 'gzip, deflate',
+                    'Accept-Encoding': 'gzip, deflate, br',
                     'Connection': 'keep-alive',
                 },
                 validateStatus: () => true,
@@ -1355,7 +1401,18 @@ export class CmsDetectorService {
                 headers: res.headers as Record<string, string>,
                 status: res.status,
             };
-        } catch { return null; }
+        } catch (err: any) {
+            const code = err?.code;
+            const transient =
+                code === 'ECONNRESET' || code === 'ETIMEDOUT' ||
+                code === 'ECONNABORTED' || code === 'EAI_AGAIN' ||
+                code === 'ERR_BAD_RESPONSE';
+            if (transient && !retried) {
+                await new Promise(r => setTimeout(r, 300));
+                return this.fetchPage(url, true);
+            }
+            return null;
+        }
     }
 
     private readonly USER_AGENTS = [

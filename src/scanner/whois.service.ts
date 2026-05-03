@@ -18,6 +18,9 @@ export interface WhoisData {
 
 @Injectable()
 export class WhoisService {
+  private readonly cache = new Map<string, { data: WhoisData; exp: number }>();
+  private readonly TTL = 6 * 60 * 60 * 1000; // 6h
+
   constructor(private readonly alertsService: AlertsService) {}
 
   async lookup(domain: string, websiteId?: string): Promise<WhoisData> {
@@ -34,6 +37,9 @@ export class WhoisService {
 
     if (!host.endsWith('.uz')) return empty;
 
+    const cached = this.cache.get(host);
+    if (cached && Date.now() < cached.exp) return cached.data;
+
     const [ipAddresses, whoisResult] = await Promise.all([
       this.resolveIPs(host),
       this.fetchWhois(host),
@@ -46,6 +52,7 @@ export class WhoisService {
       this.alertsService.checkExpiry(host, result.expirationDate, websiteId).catch(() => {});
     }
 
+    this.cache.set(host, { data: result, exp: Date.now() + this.TTL });
     return result;
   }
 
