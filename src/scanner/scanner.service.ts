@@ -181,8 +181,7 @@ export class ScannerService {
       const blocked =
         xfo === 'deny' ||
         xfo === 'sameorigin' ||
-        /frame-ancestors\s+['"]?none['"]?/i.test(csp) ||
-        /frame-ancestors\s+['"]?self['"]?/i.test(csp);
+        (/frame-ancestors/i.test(csp) && !/frame-ancestors\s+\*/i.test(csp));
       return { canEmbed: !blocked };
     } catch {
       return { canEmbed: false };
