@@ -64,6 +64,23 @@ export class AlertsService {
     await this.upsertAlert({ domain, type: sslType, message, dueDate, websiteId });
   }
 
+  // CMS change detection alert
+  async checkCmsChange(domain: string, oldCms: string, newCms: string, websiteId?: string) {
+    const message = `${domain}: CMS o'zgardi — ${oldCms} → ${newCms}`;
+    const dueDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    await this.upsertAlert({ domain, type: 'cms_change', message, dueDate, websiteId });
+  }
+
+  // Site down alert
+  async checkSiteDown(domain: string, httpStatus: number | null, websiteId?: string) {
+    const isDown = httpStatus === null || httpStatus >= 500;
+    if (!isDown) return;
+    const status = httpStatus === null ? 'timeout/xatolik' : `HTTP ${httpStatus}`;
+    const message = `${domain}: Sayt ishlamayapti (${status})`;
+    const dueDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    await this.upsertAlert({ domain, type: 'site_down', message, dueDate, websiteId });
+  }
+
   private async upsertAlert(data: {
     domain: string; type: string; message: string;
     dueDate: Date; websiteId?: string;

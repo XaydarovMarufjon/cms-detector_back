@@ -1,8 +1,9 @@
 // src/scanner/scanner.controller.ts
 import {
   Controller, Get, Post, Delete, Patch,
-  Param, Body, Query, HttpCode, UseGuards,
+  Param, Body, Query, HttpCode, UseGuards, Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
 import { ScannerService } from './scanner.service';
 import { SubdomainService } from './subdomain.service';
 import { WhoisService } from './whois.service';
@@ -27,6 +28,14 @@ export class ScannerController {
   // ── Hamma ko'ra oladi ────────────────────────────
   @Get('results')
   getResults() { return this.scanner.getLatestResults(); }
+
+  @Get('export')
+  async exportCsv(@Res() res: Response) {
+    const csv = await this.scanner.exportCsv();
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="cms-scan-results.csv"');
+    res.send(csv);
+  }
 
   @Get('can-embed')
   canEmbed(@Query('url') url: string) { return this.scanner.checkCanEmbed(url); }

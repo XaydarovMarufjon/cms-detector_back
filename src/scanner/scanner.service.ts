@@ -7,6 +7,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CmsDetectorService } from './cms-detector.service';
 import { WhoisService } from './whois.service';
 import { SiteInfoService } from './site-info.service';
+import { AlertsService } from '../alerts/alerts.service';
 import pLimit from 'p-limit';
 
 @Injectable()
@@ -20,6 +21,7 @@ export class ScannerService {
     private readonly scheduler: SchedulerRegistry,
     private readonly whois: WhoisService,
     private readonly siteInfo: SiteInfoService,
+    private readonly alerts: AlertsService,
   ) {
     this.startDefaultJob();
     this.startExpiryCheckJob();
@@ -134,9 +136,10 @@ export class ScannerService {
 
   // ── SCAN ONE ──────────────────────────────────────────────────────────────
   async scanOne(websiteId: string, url: string) {
+    const host = this.extractHost(url);
     try {
       const result = await this.detector.detect(url);
-      return this.prisma.scanResult.create({
+      const saved = await this.prisma.scanResult.create({
         data: {
           websiteId,
           cms: result.cms,
@@ -151,20 +154,40 @@ export class ScannerService {
           pageTitle: result.pageTitle,
         },
       });
-    } catch (err) {
-      let message = 'Unknown error';
 
-      if (err instanceof Error) {
-        message = err.message;
+      // CMS change detection
+      const prev = await this.prisma.scanResult.findFirst({
+        where: { websiteId, id: { not: saved.id } },
+        orderBy: { scannedAt: 'desc' },
+      });
+      if (prev?.cms && result.cms && prev.cms !== result.cms) {
+        this.alerts.checkCmsChange(host, prev.cms, result.cms, websiteId).catch(() => {});
       }
 
+      // Site down alert
+      if (result.httpStatus !== null) {
+        this.alerts.checkSiteDown(host, result.httpStatus, websiteId).catch(() => {});
+      }
+
+      return saved;
+    } catch (err) {
+      let message = 'Unknown error';
+      if (err instanceof Error) message = err.message;
+
+      // Site is unreachable
+      this.alerts.checkSiteDown(host, null, websiteId).catch(() => {});
+
       return this.prisma.scanResult.create({
-        data: {
-          websiteId,
-          errorMessage: message,
-        },
+        data: { websiteId, errorMessage: message },
       });
     }
+  }
+
+  private extractHost(url: string): string {
+    try {
+      const u = url.startsWith('http') ? url : `https://${url}`;
+      return new URL(u).hostname;
+    } catch { return url; }
   }
 
   // ── CAN EMBED ─────────────────────────────────────────────────────────────
@@ -195,5 +218,30 @@ export class ScannerService {
       orderBy: { scannedAt: 'desc' },
       include: { website: true },
     });
+  }
+
+  // ── CSV EXPORT ────────────────────────────────────────────────────────────
+  async exportCsv(): Promise<string> {
+    const results = await this.getLatestResults();
+    const esc = (v: string | null | undefined) =>
+      v ? `"${String(v).replace(/"/g, '""')}"` : '';
+
+    const header = 'URL,Label,CMS,Version,Category,Confidence,HTTP Status,Page Title,Server Tech,JS Frameworks,Scanned At,Error\n';
+    const rows = results.map(r => [
+      esc(r.website?.url),
+      esc(r.website?.label),
+      esc(r.cms),
+      esc(r.version),
+      esc(r.category),
+      r.confidence?.toString() ?? '',
+      r.httpStatus?.toString() ?? '',
+      esc(r.pageTitle),
+      esc(r.serverTech?.join('; ')),
+      esc(r.jsFrameworks?.join('; ')),
+      esc(r.scannedAt?.toISOString()),
+      esc(r.errorMessage),
+    ].join(','));
+
+    return header + rows.join('\n');
   }
 }
