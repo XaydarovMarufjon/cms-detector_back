@@ -24,8 +24,7 @@ function daysUntil(d: Date): number {
 function resolveType(days: number): string | null {
   if (days <= 10)  return 'expiry_urgent';
   if (days <= 30)  return 'expiry_critical';
-  if (days <= 60)  return 'expiry_warning';
-  if (days <= 90)  return 'expiry_notice';
+  if (days <= 40)  return 'expiry_warning';
   return null;
 }
 

@@ -24,13 +24,73 @@ enum Role {
   WORKER
   MONITORING
 }
+
+enum CveStatus {
+  PENDING
+  FALSE_POSITIVE
+  CONFIRMED
+}
+
+enum FeedType {
+  NVD
+  CISA_KEV
+  EPSS
+  OSV
+  CIRCL
+  MITRE_CVE
+  MISP
+  OTX
+  VIRUSTOTAL
+}
+
+model ThreatFeed {
+  id         String    @id @default(uuid())
+  name       String
+  type       FeedType
+  url        String?
+  apiKey     String?
+  enabled    Boolean   @default(true)
+  lastSync   DateTime?
+  lastStatus String?
+  lastError  String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@map("threat_feeds")
+}
+
+model CveEnrichment {
+  id          String   @id @default(uuid())
+  cveId       String   @unique
+  cvssScore   Float?
+  cvssVector  String?
+  cvssVersion String?
+  epssScore   Float?
+  epssPercent Float?
+  isKev       Boolean  @default(false)
+  kevDueDate  String?
+  description String?
+  references  String[]
+  cweIds      String[]
+  otxPulses   Int?
+  vtMalicious Int?
+  mispEvents  Int?
+  osvFound    Boolean  @default(false)
+  osvAliases  String[]
+  sources     String[]
+  enrichedAt  DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("cve_enrichments")
+}
 model Website {
-  id        String       @id @default(uuid())
-  url       String       @unique
-  label     String?
-  createdAt DateTime     @default(now())
-  updatedAt DateTime     @updatedAt
-  scans     ScanResult[]
+  id            String          @id @default(uuid())
+  url           String          @unique
+  label         String?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  scans         ScanResult[]
+  nucleiResults NucleiResult[]
 
   @@map("websites")
 }
@@ -68,4 +128,22 @@ model ScanResult {
 
   @@index([websiteId])
   @@map("scan_results")
+}
+
+model NucleiResult {
+  id          String    @id @default(uuid())
+  websiteId   String
+  subdomain   String
+  templateId  String
+  cveId       String?
+  severity    String
+  name        String
+  description String?
+  matchedAt   String?
+  scannedAt   DateTime  @default(now())
+  status      CveStatus @default(PENDING)
+  website     Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId])
+  @@map("nuclei_results")
 }

@@ -31,6 +31,9 @@ export interface SecHeadersInfo {
   xXssProtection:       boolean;
   referrerPolicy:       boolean;
   permissionsPolicy:    boolean;
+  coopPolicy:           boolean;
+  coepPolicy:           boolean;
+  corpPolicy:           boolean;
   score:                number;   // 0-100
   grade:                string;   // A+ … F
   present:              string[];
@@ -44,13 +47,16 @@ export interface SiteInfoData {
 }
 
 const SEC_HEADERS: { key: string; name: string; points: number }[] = [
-  { key: 'strict-transport-security', name: 'HSTS',                  points: 20 },
-  { key: 'content-security-policy',   name: 'CSP',                   points: 20 },
-  { key: 'x-frame-options',           name: 'X-Frame-Options',       points: 15 },
-  { key: 'x-content-type-options',    name: 'X-Content-Type-Options', points: 15 },
-  { key: 'referrer-policy',           name: 'Referrer-Policy',       points: 15 },
-  { key: 'permissions-policy',        name: 'Permissions-Policy',    points: 10 },
-  { key: 'x-xss-protection',          name: 'X-XSS-Protection',      points: 5  },
+  { key: 'strict-transport-security',      name: 'HSTS',                        points: 17 },
+  { key: 'content-security-policy',        name: 'CSP',                         points: 17 },
+  { key: 'x-content-type-options',         name: 'X-Content-Type-Options',      points: 12 },
+  { key: 'x-frame-options',                name: 'X-Frame-Options',             points: 10 },
+  { key: 'referrer-policy',                name: 'Referrer-Policy',             points: 10 },
+  { key: 'permissions-policy',             name: 'Permissions-Policy',          points:  8 },
+  { key: 'cross-origin-opener-policy',     name: 'Cross-Origin-Opener-Policy',  points:  8 },
+  { key: 'cross-origin-embedder-policy',   name: 'Cross-Origin-Embedder-Policy', points: 8 },
+  { key: 'cross-origin-resource-policy',   name: 'Cross-Origin-Resource-Policy', points: 6 },
+  { key: 'x-xss-protection',              name: 'X-XSS-Protection',            points:  4 },
 ];
 
 @Injectable()
@@ -169,13 +175,16 @@ export class SiteInfoService {
       score >= 35 ? 'D'  : 'F';
 
     return {
-      hsts:                lower['strict-transport-security'] ? true : false,
-      csp:                 lower['content-security-policy']   ? true : false,
-      xFrameOptions:       lower['x-frame-options']           ? true : false,
-      xContentTypeOptions: lower['x-content-type-options']    ? true : false,
-      xXssProtection:      lower['x-xss-protection']          ? true : false,
-      referrerPolicy:      lower['referrer-policy']            ? true : false,
-      permissionsPolicy:   lower['permissions-policy']         ? true : false,
+      hsts:                !!lower['strict-transport-security'],
+      csp:                 !!lower['content-security-policy'],
+      xFrameOptions:       !!lower['x-frame-options'],
+      xContentTypeOptions: !!lower['x-content-type-options'],
+      xXssProtection:      !!lower['x-xss-protection'],
+      referrerPolicy:      !!lower['referrer-policy'],
+      permissionsPolicy:   !!lower['permissions-policy'],
+      coopPolicy:          !!lower['cross-origin-opener-policy'],
+      coepPolicy:          !!lower['cross-origin-embedder-policy'],
+      corpPolicy:          !!lower['cross-origin-resource-policy'],
       score, grade, present, missing,
     };
   }

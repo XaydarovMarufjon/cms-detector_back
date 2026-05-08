@@ -8,6 +8,8 @@ import { CmsDetectorService } from './cms-detector.service';
 import { SubdomainService } from './subdomain.service';
 import { WhoisService } from './whois.service';
 import { SiteInfoService } from './site-info.service';
+import { NucleiService } from './nuclei.service';
+import { ThreatIntelService } from './threat-intel.service';
 
 @Module({
   imports: [
@@ -16,6 +18,6 @@ import { SiteInfoService } from './site-info.service';
     AlertsModule,
   ],
   controllers: [ScannerController],
-  providers: [ScannerService, CmsDetectorService, SubdomainService, WhoisService, SiteInfoService],
+  providers: [ScannerService, CmsDetectorService, SubdomainService, WhoisService, SiteInfoService, NucleiService, ThreatIntelService],
 })
 export class ScannerModule { }
