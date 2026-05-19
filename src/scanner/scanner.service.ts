@@ -125,13 +125,31 @@ export class ScannerService {
 
   async scanAll() {
     const sites = await this.prisma.website.findMany();
-    const limit = pLimit(10); // bir vaqtning o‘zida 10 ta
+    // Lower concurrency: at 10+ parallel, ~30 simultaneous fetches saturate the
+    // local resolver / TCP stack and many sites flap to "unreachable".
+    const limit = pLimit(4);
 
-    return Promise.all(
+    const firstPass = await Promise.all(
       sites.map(site =>
-        limit(() => this.scanOne(site.id, site.url))
+        limit(async () => {
+          const r = await this.scanOne(site.id, site.url);
+          await new Promise(res => setTimeout(res, 200));
+          return { site, result: r };
+        })
       )
     );
+
+    // Second pass — sequential retry for sites with no httpStatus and no CMS
+    // (likely concurrency-induced transient fetch failures, not real blocks).
+    const failed = firstPass.filter(p => p.result?.httpStatus == null && !p.result?.cms);
+    for (const { site } of failed) {
+      try {
+        await this.scanOne(site.id, site.url);
+        await new Promise(res => setTimeout(res, 400));
+      } catch { /* ignore */ }
+    }
+
+    return firstPass.map(p => p.result);
   }
 
   // ── SCAN ONE ──────────────────────────────────────────────────────────────
@@ -139,6 +157,13 @@ export class ScannerService {
     const host = this.extractHost(url);
     try {
       const result = await this.detector.detect(url);
+
+      const fetchedNothing =
+        result.httpStatus === null &&
+        !result.cms &&
+        !result.serverTech.length &&
+        Object.keys(result.rawSignals || {}).length === 0;
+
       const saved = await this.prisma.scanResult.create({
         data: {
           websiteId,
@@ -152,6 +177,7 @@ export class ScannerService {
           rawSignals: result.rawSignals,
           httpStatus: result.httpStatus,
           pageTitle: result.pageTitle,
+          errorMessage: fetchedNothing ? 'Site unreachable (all fetches failed)' : null,
         },
       });
 

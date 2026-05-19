@@ -93,8 +93,8 @@ export class CmsDetectorService implements OnModuleInit {
     private readonly DOMAIN_COOLDOWN_MS = 60_000;     // 60s cooldown
     private domainCooldown = new Map<string, number>();
 
-    private readonly httpAgent  = new http.Agent({  keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 8_000 });
-    private readonly httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 8_000, rejectUnauthorized: false });
+    private readonly httpAgent  = new http.Agent({  keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 25_000 });
+    private readonly httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 25_000, rejectUnauthorized: false });
 
     private readonly detectCache = new Map<string, { result: CmsDetectionResult; exp: number }>();
     private readonly DETECT_TTL = 30 * 60 * 1000; // 30 min
@@ -984,10 +984,13 @@ export class CmsDetectorService implements OnModuleInit {
         // Backend Frameworks
         Laravel: 'Backend Framework', Django: 'Backend Framework',
         'Ruby on Rails': 'Backend Framework', 'Express.js': 'Backend Framework',
-        'ASP.NET': 'Backend Framework', 'Spring Boot': 'Backend Framework',
+        'ASP.NET': 'Backend Framework', 'ASP.NET Core': 'Backend Framework',
+        'Spring Boot': 'Backend Framework',
         FastAPI: 'Backend Framework', Flask: 'Backend Framework',
         Symfony: 'Backend Framework', CakePHP: 'Backend Framework',
         CodeIgniter: 'Backend Framework', Yii2: 'Backend Framework',
+        // Frontend / Build tools
+        Vite: 'Frontend Framework / SPA', 'SPA (Custom)': 'Frontend Framework / SPA',
         // Headless CMS
         Contentful: 'Headless CMS', Sanity: 'Headless CMS', Strapi: 'Headless CMS',
         Directus: 'Headless CMS', Prismic: 'Headless CMS', DatoCMS: 'Headless CMS',
@@ -1037,6 +1040,13 @@ export class CmsDetectorService implements OnModuleInit {
         {
             name: 'Astro',
             patterns: [/astro-island/i, /@astrojs/i, /astro:page-load/i],
+        },
+        {
+            name: 'Vite',
+            patterns: [
+                /<script[^>]+type=["']module["'][^>]+src=["']\/assets\/index-[A-Za-z0-9_-]+\.js/i,
+                /<link[^>]+rel=["']modulepreload["'][^>]+href=["']\/assets\//i,
+            ],
         },
         {
             name: 'Django',
@@ -1195,6 +1205,22 @@ export class CmsDetectorService implements OnModuleInit {
 
         const result = this.resolveResult(baseUrl, signals, rawSignals, serverTech, jsFrameworks, httpStatus, pageTitle, mainPage_result?.html ?? '', mainPage_result?.headers ?? {});
 
+        // SPA-shell fallback: when nothing CMS-like matched but the page is a
+        // bare SPA shell (root mount node + minimal body), label as SPA so the
+        // UI shows something more useful than "Unknown".
+        if (!result.cms && mainPage_result?.html) {
+            const html = mainPage_result.html;
+            const hasShell = /<div[^>]+id=["'](?:root|app|__next|__nuxt)["'][^>]*>\s*<\/div>/i.test(html)
+                || /<div[^>]+id=["'](?:root|app)["'][^>]*>(?:\s|<!--[\s\S]*?-->)*<\/div>/i.test(html);
+            if (hasShell || jsFrameworks.length > 0) {
+                const cmsName = jsFrameworks[0] ?? 'SPA (Custom)';
+                result.cms = cmsName;
+                result.confidence = jsFrameworks.length ? 55 : 45;
+                result.category = 'Frontend Framework / SPA';
+                result.detectionMethod = [...result.detectionMethod, hasShell ? 'SPA shell' : `JS framework: ${cmsName}`];
+            }
+        }
+
         // Cache only successful (non-empty) detections
         if (result.cms || serverTech.length || jsFrameworks.length) {
             this.detectCache.set(baseUrl, { result, exp: Date.now() + this.DETECT_TTL });
@@ -1252,6 +1278,13 @@ export class CmsDetectorService implements OnModuleInit {
             { re: /_shopify_/i, name: 'Shopify', category: 'CMS', confidence: 92 },
             { re: /PrestaShop/i, name: 'PrestaShop', category: 'CMS', confidence: 85 },
             { re: /ss_cvr/i, name: 'Squarespace', category: 'CMS', confidence: 85 },
+            { re: /_csrf-frontend|_csrf-backend|_identity-frontend|_identity-backend/i, name: 'Yii2', category: 'Backend Framework', confidence: 90 },
+            { re: /_csrf=[a-f0-9]+%3A2%3A%7Bi%3A0%3Bs%3A5%3A%22_csrf%22/i, name: 'Yii2', category: 'Backend Framework', confidence: 92 },
+            { re: /OCSESSID/i, name: 'OpenCart', category: 'CMS', confidence: 85 },
+            { re: /ci_session/i, name: 'CodeIgniter', category: 'Backend Framework', confidence: 85 },
+            { re: /symfony/i, name: 'Symfony', category: 'Backend Framework', confidence: 80 },
+            { re: /\.AspNetCore\.(Antiforgery|Cookies|Identity|Session|Mvc)/i, name: 'ASP.NET Core', category: 'Backend Framework', confidence: 92 },
+            { re: /ASP\.NET_SessionId/i, name: 'ASP.NET', category: 'Backend Framework', confidence: 90 },
         ];
 
         for (const { re, name, category, confidence } of cookieMap) {
@@ -1338,6 +1371,11 @@ export class CmsDetectorService implements OnModuleInit {
                 signals.push({ name, version: null, category, confidence: 70, method: 'robots.txt' });
             }
         }
+        // SPA-served HTML at /robots.txt
+        if (/__NEXT_DATA__|\/_next\/static\//i.test(body))
+            signals.push({ name: 'Next.js', version: null, category: 'Fullstack Framework', confidence: 80, method: 'robots.txt (SPA)' });
+        if (/__NUXT__|\/_nuxt\//i.test(body))
+            signals.push({ name: 'Nuxt.js', version: null, category: 'Fullstack Framework', confidence: 80, method: 'robots.txt (SPA)' });
         return signals;
     }
 
@@ -1354,6 +1392,13 @@ export class CmsDetectorService implements OnModuleInit {
             signals.push({ name: 'Joomla', version: null, category: 'CMS', confidence: 70, method: 'sitemap.xml' });
         if (/\/sites\/default\//i.test(body))
             signals.push({ name: 'Drupal', version: null, category: 'CMS', confidence: 70, method: 'sitemap.xml' });
+        // SPA-served HTML at /sitemap.xml: hint at framework
+        if (/__NEXT_DATA__|\/_next\/static\//i.test(body))
+            signals.push({ name: 'Next.js', version: null, category: 'Fullstack Framework', confidence: 80, method: 'sitemap.xml (SPA)' });
+        if (/__NUXT__|\/_nuxt\//i.test(body))
+            signals.push({ name: 'Nuxt.js', version: null, category: 'Fullstack Framework', confidence: 80, method: 'sitemap.xml (SPA)' });
+        if (/ng-version=/i.test(body))
+            signals.push({ name: 'Angular', version: null, category: 'Frontend Framework / SPA', confidence: 75, method: 'sitemap.xml (SPA)' });
 
         return signals;
     }
@@ -1726,31 +1771,39 @@ export class CmsDetectorService implements OnModuleInit {
     }
 
     // ── FETCH PAGE ────────────────────────────────────────────────────────────
+    // attempt 0: proxy/keep-alive agent + brotli
+    // attempt 1: bare axios (no shared agent), gzip/deflate only — works around
+    //            keep-alive socket reuse and brotli decompression failures
+    //            observed on some IIS / static-host targets (lex.uz, asaka.uz...)
     private async fetchPage(
         url: string,
-        retried = false,
+        attempt = 0,
     ): Promise<{ html: string; headers: Record<string, string>; status: number } | null> {
         // Skip if domain is in 429/403 cooldown
         if (this.getDomainCooldown(url) > 0) return null;
 
-        const { agent: proxyAgent, proxyUrl } = this.getNextAgent();
+        const bare = attempt > 0;
+        const { agent: proxyAgent, proxyUrl } = bare
+            ? { agent: undefined, proxyUrl: null as string | null }
+            : this.getNextAgent();
         try {
             const res: AxiosResponse = await axios.get(url, {
-                timeout: 12_000,
+                timeout: 20_000,
                 maxRedirects: 5,
-                maxContentLength: 2 * 1024 * 1024,
-                maxBodyLength: 2 * 1024 * 1024,
+                maxContentLength: 5 * 1024 * 1024,
+                maxBodyLength: 5 * 1024 * 1024,
                 decompress: true,
                 responseType: 'text',
                 transitional: { silentJSONParsing: true, forcedJSONParsing: false },
-                httpAgent:  proxyAgent ?? this.httpAgent,
-                httpsAgent: proxyAgent ?? this.httpsAgent,
+                ...(bare
+                    ? {}
+                    : { httpAgent: proxyAgent ?? this.httpAgent, httpsAgent: proxyAgent ?? this.httpsAgent }),
                 headers: {
                     'User-Agent': this.randomUserAgent(),
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                     'Accept-Language': 'uz-UZ,uz;q=0.9,en-US;q=0.8,en;q=0.7,ru;q=0.6',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Connection': 'keep-alive',
+                    'Accept-Encoding': bare ? 'gzip, deflate' : 'gzip, deflate, br',
+                    'Connection': bare ? 'close' : 'keep-alive',
                 },
                 validateStatus: () => true,
             });
@@ -1760,7 +1813,6 @@ export class CmsDetectorService implements OnModuleInit {
                 this.setDomainCooldown(url);
             }
 
-            // Proxy health: count as success if we got any HTTP response
             this.reportProxyResult(proxyUrl, true);
 
             return {
@@ -1769,17 +1821,18 @@ export class CmsDetectorService implements OnModuleInit {
                 status: res.status,
             };
         } catch (err: any) {
-            // Proxy or network failure — mark proxy as failed
             this.reportProxyResult(proxyUrl, false);
 
             const code = err?.code;
             const transient =
                 code === 'ECONNRESET' || code === 'ETIMEDOUT' ||
                 code === 'ECONNABORTED' || code === 'EAI_AGAIN' ||
-                code === 'ERR_BAD_RESPONSE';
-            if (transient && !retried) {
+                code === 'ERR_BAD_RESPONSE' || code === 'EPROTO' ||
+                code === 'ERR_BROTLI_DECOMPRESSION_FAILED' ||
+                code === 'Z_BUF_ERROR' || code === 'Z_DATA_ERROR';
+            if (transient && attempt < 1) {
                 await new Promise(r => setTimeout(r, 300));
-                return this.fetchPage(url, true);
+                return this.fetchPage(url, attempt + 1);
             }
             return null;
         }
