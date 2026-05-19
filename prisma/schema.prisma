@@ -147,3 +147,25 @@ model NucleiResult {
   @@index([websiteId])
   @@map("nuclei_results")
 }
+
+model CallCategory {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  color     String   @default("normal")
+  createdAt DateTime @default(now())
+
+  @@map("call_categories")
+}
+
+model Call {
+  id          String   @id @default(uuid())
+  category    String
+  phoneNumber String?
+  note        String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([category])
+  @@index([createdAt])
+  @@map("calls")
+}

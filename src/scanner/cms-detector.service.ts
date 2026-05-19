@@ -1,10 +1,19 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import axios, { AxiosResponse } from 'axios';
 import * as cheerio from 'cheerio';
 import * as http from 'http';
 import * as https from 'https';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+
+interface ProxySourceStatus {
+  url:        string;
+  protocol:   string;
+  ok:         boolean;
+  count:      number;
+  error?:     string;
+  fetchedAt:  string;
+}
 
 export type SiteCategory =
   | 'CMS'
@@ -52,25 +61,371 @@ interface TechSignal {
 }
 
 @Injectable()
-export class CmsDetectorService {
+export class CmsDetectorService implements OnModuleInit {
     private readonly logger = new Logger(CmsDetectorService.name);
 
-    private readonly proxies: string[] = (process.env['PROXY_LIST'] || '')
+    private proxies: string[] = (process.env['PROXY_LIST'] || '')
         .split(',').map(p => p.trim()).filter(Boolean);
     private proxyIndex = 0;
 
-    private readonly httpAgent  = new http.Agent({  keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 30_000 });
-    private readonly httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 30_000, rejectUnauthorized: false });
+    // Auto-refresh state
+    private readonly refreshMinutes = Math.max(5, Number(process.env['PROXY_REFRESH_MINUTES'] || 360));
+    private readonly maxProxies     = Math.max(10, Number(process.env['PROXY_MAX'] || 200));
+    private readonly sources        = (process.env['PROXY_SOURCES'] || '')
+        .split(',').map(s => s.trim()).filter(Boolean)
+        .map(spec => {
+            const [proto, url] = spec.split('|');
+            return { protocol: (proto || 'http').toLowerCase(), url: (url || '').trim() };
+        })
+        .filter(s => s.url);
+    private lastRefresh: string | null = null;
+    private refreshing = false;
+    private sourceStatus: ProxySourceStatus[] = [];
+    private refreshTimer: NodeJS.Timeout | null = null;
+    private autoRefreshEnabled = false;  // set in onModuleInit based on sources
+
+    // Proxy health tracker — free proxies: aggressive
+    private readonly PROXY_DEAD_AFTER = 1;            // 1 fail → dead (free proxies rarely revive)
+    private readonly PROXY_REVIVE_MS  = 30 * 60_000;  // try again after 30 min
+    private proxyHealth = new Map<string, { fails: number; deadUntil: number; lastOk: number }>();
+
+    // Per-domain backoff (429/403)
+    private readonly DOMAIN_COOLDOWN_MS = 60_000;     // 60s cooldown
+    private domainCooldown = new Map<string, number>();
+
+    private readonly httpAgent  = new http.Agent({  keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 8_000 });
+    private readonly httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 8_000, rejectUnauthorized: false });
 
     private readonly detectCache = new Map<string, { result: CmsDetectionResult; exp: number }>();
     private readonly DETECT_TTL = 30 * 60 * 1000; // 30 min
 
-    private getNextAgent(): any {
-        if (!this.proxies.length) return undefined;
-        const proxy = this.proxies[this.proxyIndex % this.proxies.length];
-        this.proxyIndex++;
-        if (proxy.startsWith('socks4://') || proxy.startsWith('socks5://')) return new SocksProxyAgent(proxy);
-        return new HttpsProxyAgent(proxy);
+    private getNextAgent(): { agent: any; proxyUrl: string } | { agent: undefined; proxyUrl: null } {
+        if (!this.proxies.length) return { agent: undefined, proxyUrl: null };
+        const now = Date.now();
+        // Try up to N times to find a healthy proxy (N = proxies.length)
+        for (let i = 0; i < this.proxies.length; i++) {
+            const proxy = this.proxies[this.proxyIndex % this.proxies.length];
+            this.proxyIndex++;
+            const h = this.proxyHealth.get(proxy);
+            if (h && h.deadUntil > now) continue;  // skip dead proxy
+            const agent = (proxy.startsWith('socks4://') || proxy.startsWith('socks5://'))
+                ? new SocksProxyAgent(proxy)
+                : new HttpsProxyAgent(proxy);
+            return { agent, proxyUrl: proxy };
+        }
+        // All dead — fall back to direct (own IP) rather than fail
+        return { agent: undefined, proxyUrl: null };
+    }
+
+    private reportProxyResult(proxyUrl: string | null, ok: boolean) {
+        if (!proxyUrl) return;
+        const h = this.proxyHealth.get(proxyUrl) || { fails: 0, deadUntil: 0, lastOk: 0 };
+        if (ok) {
+            h.fails = 0;
+            h.lastOk = Date.now();
+            h.deadUntil = 0;
+        } else {
+            h.fails++;
+            if (h.fails >= this.PROXY_DEAD_AFTER) {
+                h.deadUntil = Date.now() + this.PROXY_REVIVE_MS;
+            }
+        }
+        this.proxyHealth.set(proxyUrl, h);
+    }
+
+    private getDomainCooldown(url: string): number {
+        try {
+            const host = new URL(url).hostname;
+            const until = this.domainCooldown.get(host);
+            return until && until > Date.now() ? until : 0;
+        } catch { return 0; }
+    }
+
+    private setDomainCooldown(url: string) {
+        try {
+            const host = new URL(url).hostname;
+            this.domainCooldown.set(host, Date.now() + this.DOMAIN_COOLDOWN_MS);
+        } catch { /* ignore */ }
+    }
+
+    async onModuleInit() {
+        if (this.sources.length) {
+            this.autoRefreshEnabled = true;
+            this.startAutoRefresh();
+        }
+    }
+
+    private startAutoRefresh() {
+        if (this.refreshTimer) return;
+        this.logger.log(`Proxy auto-refresh: ${this.sources.length} source(s), every ${this.refreshMinutes} min`);
+        this.refreshProxies().catch(e => this.logger.error(`Initial proxy refresh failed: ${e?.message}`));
+        this.refreshTimer = setInterval(
+            () => this.refreshProxies().catch(e => this.logger.error(`Proxy refresh failed: ${e?.message}`)),
+            this.refreshMinutes * 60_000,
+        );
+    }
+
+    private stopAutoRefresh() {
+        if (this.refreshTimer) {
+            clearInterval(this.refreshTimer);
+            this.refreshTimer = null;
+        }
+    }
+
+    setAutoRefreshEnabled(enabled: boolean): { enabled: boolean } {
+        if (enabled === this.autoRefreshEnabled) return { enabled };
+        this.autoRefreshEnabled = enabled;
+        if (enabled) {
+            if (!this.sources.length) {
+                this.logger.warn('Avto-yangilash yoqildi, lekin PROXY_SOURCES bo\'sh');
+            } else {
+                this.startAutoRefresh();
+            }
+        } else {
+            this.stopAutoRefresh();
+            // Wipe so getNextAgent() returns undefined → axios uses default agent → own IP
+            this.proxies = [];
+            this.proxyIndex = 0;
+            this.sourceStatus = [];
+            this.lastRefresh = null;
+            this.logger.log('Avto-yangilash o\'chirildi — skaner o\'z IP orqali ishlaydi');
+        }
+        return { enabled };
+    }
+
+    async refreshProxies(): Promise<{ total: number; sources: ProxySourceStatus[] }> {
+        if (this.refreshing) return { total: this.proxies.length, sources: this.sourceStatus };
+        this.refreshing = true;
+        try {
+            const collected = new Set<string>();
+            const statuses: ProxySourceStatus[] = [];
+            const perSourceQuota = Math.max(20, Math.ceil(this.maxProxies / Math.max(this.sources.length, 1)));
+            let capReached = false;
+            for (const src of this.sources) {
+                const status: ProxySourceStatus = {
+                    url: src.url, protocol: src.protocol,
+                    ok: false, count: 0, fetchedAt: new Date().toISOString(),
+                };
+                if (capReached) {
+                    status.error = `oraliq cheklov (${this.maxProxies}) to'ldi`;
+                    statuses.push(status);
+                    continue;
+                }
+                try {
+                    const resp = await axios.get<string>(src.url, {
+                        timeout: 15_000,
+                        responseType: 'text',
+                        transformResponse: [(d) => d],
+                        validateStatus: s => s >= 200 && s < 300,
+                    });
+                    const body = typeof resp.data === 'string' ? resp.data : String(resp.data);
+                    const lines = body.split(/\r?\n/);
+                    let added = 0;
+                    for (const ln of lines) {
+                        const t = ln.trim();
+                        if (!t) continue;
+                        const normalized = this.normalizeProxyLine(t, src.protocol);
+                        if (normalized && !collected.has(normalized)) {
+                            collected.add(normalized);
+                            added++;
+                            if (added >= perSourceQuota) break;
+                            if (collected.size >= this.maxProxies) break;
+                        }
+                    }
+                    status.ok = true;
+                    status.count = added;
+                } catch (e: any) {
+                    status.ok = false;
+                    status.error = e?.message || 'fetch failed';
+                }
+                statuses.push(status);
+                if (collected.size >= this.maxProxies) capReached = true;
+            }
+            const list = Array.from(collected);
+            const validated = list.length ? await this.validateProxies(list) : [];
+            if (validated.length) {
+                this.proxies = validated;
+                this.proxyIndex = 0;
+                this.proxyHealth.clear();   // fresh start for new list
+                this.logger.log(`Proxy validation: ${validated.length}/${list.length} alive`);
+            } else if (list.length) {
+                this.logger.warn(`Proxy validation: 0/${list.length} alive — keeping previous list`);
+            } else {
+                this.logger.warn('Proxy refresh returned 0 proxies — keeping previous list');
+            }
+            this.sourceStatus = statuses;
+            this.lastRefresh = new Date().toISOString();
+            this.logger.log(`Proxy refresh done: ${this.proxies.length} total (${statuses.filter(s => s.ok).length}/${statuses.length} sources ok)`);
+            return { total: this.proxies.length, sources: statuses };
+        } finally {
+            this.refreshing = false;
+        }
+    }
+
+    private async pingProxy(proxy: string, timeoutMs = 4000): Promise<boolean> {
+        try {
+            const agent = (proxy.startsWith('socks4://') || proxy.startsWith('socks5://'))
+                ? new SocksProxyAgent(proxy)
+                : new HttpsProxyAgent(proxy);
+            const r = await axios.get<any>('https://api.ipify.org/?format=json', {
+                timeout: timeoutMs,
+                httpAgent: agent,
+                httpsAgent: agent,
+                proxy: false,
+                validateStatus: s => s >= 200 && s < 300,
+            });
+            return !!r.data?.ip;
+        } catch {
+            return false;
+        }
+    }
+
+    private async validateProxies(list: string[]): Promise<string[]> {
+        const CONCURRENCY = 50;
+        const alive: string[] = [];
+        for (let i = 0; i < list.length; i += CONCURRENCY) {
+            const batch = list.slice(i, i + CONCURRENCY);
+            const results = await Promise.all(batch.map(async p => ({ p, ok: await this.pingProxy(p) })));
+            for (const { p, ok } of results) if (ok) alive.push(p);
+        }
+        return alive;
+    }
+
+    private normalizeProxyLine(raw: string, defaultProto: string): string | null {
+        // Already has protocol prefix
+        if (/^(socks5|socks4|https?):\/\//i.test(raw)) {
+            const m = raw.match(/^(socks5|socks4|https?):\/\/(?:[^@]+@)?([^:\/\s]+):(\d{2,5})\b/i);
+            return m ? raw.split(/\s+/)[0] : null;
+        }
+        // Bare ip:port
+        const m = raw.match(/^([0-9a-zA-Z][\w.-]*):(\d{2,5})$/);
+        if (m) return `${defaultProto}://${m[1]}:${m[2]}`;
+        return null;
+    }
+
+    async testProxy(input?: { proxy?: string; index?: number }): Promise<{
+        mode:        'proxy' | 'own-ip';
+        proxy:       { protocol: string; host: string; port: string; hasAuth: boolean } | null;
+        working:     boolean;
+        latencyMs:   number;
+        outboundIp:  string | null;
+        error?:      string;
+    }> {
+        let raw: string | undefined;
+        if (input?.proxy) raw = input.proxy;
+        else if (typeof input?.index === 'number') raw = this.proxies[input.index];
+        else if (this.proxies.length) raw = this.proxies[this.proxyIndex % this.proxies.length];
+
+        const TARGET = 'https://api.ipify.org/?format=json';
+        const t0 = Date.now();
+
+        const parseProxy = (r: string) => {
+            const m = r.match(/^(socks5|socks4|https?):\/\/(?:([^:@]+)(?::[^@]+)?@)?([^:\/]+)(?::(\d+))?/i);
+            if (!m) return null;
+            return { protocol: m[1].toLowerCase(), host: m[3], port: m[4] ?? '', hasAuth: /@/.test(r) };
+        };
+
+        if (!raw) {
+            // Own-IP test
+            try {
+                const r = await axios.get<any>(TARGET, { timeout: 6000 });
+                return {
+                    mode: 'own-ip', proxy: null,
+                    working: true, latencyMs: Date.now() - t0,
+                    outboundIp: r.data?.ip || null,
+                };
+            } catch (e: any) {
+                return {
+                    mode: 'own-ip', proxy: null,
+                    working: false, latencyMs: Date.now() - t0,
+                    outboundIp: null, error: e?.code || e?.message || 'failed',
+                };
+            }
+        }
+
+        const meta = parseProxy(raw);
+        const agent = raw.startsWith('socks4://') || raw.startsWith('socks5://')
+            ? new SocksProxyAgent(raw)
+            : new HttpsProxyAgent(raw);
+        try {
+            const r = await axios.get<any>(TARGET, {
+                timeout: 8000,
+                httpAgent: agent, httpsAgent: agent,
+                proxy: false,
+            });
+            return {
+                mode: 'proxy', proxy: meta,
+                working: true, latencyMs: Date.now() - t0,
+                outboundIp: r.data?.ip || null,
+            };
+        } catch (e: any) {
+            return {
+                mode: 'proxy', proxy: meta,
+                working: false, latencyMs: Date.now() - t0,
+                outboundIp: null,
+                error: e?.code || (e?.message || '').slice(0, 80) || 'failed',
+            };
+        }
+    }
+
+    getProxyStats() {
+        const now = Date.now();
+        const masked = this.proxies.map((raw, i) => {
+            let protocol = 'http';
+            let host = raw;
+            let port = '';
+            const m = raw.match(/^(socks5|socks4|https?):\/\/(?:([^:@]+)(?::[^@]+)?@)?([^:\/]+)(?::(\d+))?/i);
+            if (m) {
+                protocol = m[1].toLowerCase();
+                host     = m[3];
+                port     = m[4] ?? '';
+            }
+            const h = this.proxyHealth.get(raw);
+            const dead = !!(h && h.deadUntil > now);
+            return {
+                index:    i,
+                protocol,
+                host,
+                port,
+                hasAuth:  /@/.test(raw),
+                active:   i === (this.proxyIndex % Math.max(this.proxies.length, 1)),
+                dead,
+                fails:    h?.fails    ?? 0,
+                deadUntil: dead ? new Date(h!.deadUntil).toISOString() : null,
+            };
+        });
+        const deadCount = masked.filter(p => p.dead).length;
+        // Clean up expired domain cooldowns and compute count
+        const activeCooldowns: { host: string; remainingSec: number }[] = [];
+        for (const [host, until] of this.domainCooldown.entries()) {
+            if (until <= now) this.domainCooldown.delete(host);
+            else activeCooldowns.push({ host, remainingSec: Math.ceil((until - now) / 1000) });
+        }
+        return {
+            total:        this.proxies.length,
+            alive:        this.proxies.length - deadCount,
+            dead:         deadCount,
+            currentIndex: this.proxies.length ? this.proxyIndex % this.proxies.length : 0,
+            rotations:    this.proxyIndex,
+            proxies:      masked,
+            domainCooldowns: activeCooldowns,
+            health: {
+                deadAfterFails:   this.PROXY_DEAD_AFTER,
+                reviveMinutes:    Math.round(this.PROXY_REVIVE_MS / 60_000),
+                domainCooldownSec: Math.round(this.DOMAIN_COOLDOWN_MS / 1000),
+            },
+            autoRefresh: {
+                enabled:         this.autoRefreshEnabled,
+                available:       this.sources.length > 0,
+                intervalMinutes: this.refreshMinutes,
+                maxProxies:      this.maxProxies,
+                lastRefresh:     this.lastRefresh,
+                refreshing:      this.refreshing,
+                sources:         this.sourceStatus.length
+                    ? this.sourceStatus
+                    : this.sources.map(s => ({ url: s.url, protocol: s.protocol, ok: false, count: 0, fetchedAt: '' })),
+            },
+        };
     }
 
     // ── CMS PATTERNS ─────────────────────────────────────────────────────────
@@ -1375,12 +1730,15 @@ export class CmsDetectorService {
         url: string,
         retried = false,
     ): Promise<{ html: string; headers: Record<string, string>; status: number } | null> {
-        const proxyAgent = this.getNextAgent();
+        // Skip if domain is in 429/403 cooldown
+        if (this.getDomainCooldown(url) > 0) return null;
+
+        const { agent: proxyAgent, proxyUrl } = this.getNextAgent();
         try {
             const res: AxiosResponse = await axios.get(url, {
                 timeout: 12_000,
                 maxRedirects: 5,
-                maxContentLength: 2 * 1024 * 1024,   // 2 MB cap — block bloated pages
+                maxContentLength: 2 * 1024 * 1024,
                 maxBodyLength: 2 * 1024 * 1024,
                 decompress: true,
                 responseType: 'text',
@@ -1396,12 +1754,24 @@ export class CmsDetectorService {
                 },
                 validateStatus: () => true,
             });
+
+            // Per-domain cooldown for 429/403
+            if (res.status === 429 || res.status === 403) {
+                this.setDomainCooldown(url);
+            }
+
+            // Proxy health: count as success if we got any HTTP response
+            this.reportProxyResult(proxyUrl, true);
+
             return {
                 html: typeof res.data === 'string' ? res.data : JSON.stringify(res.data),
                 headers: res.headers as Record<string, string>,
                 status: res.status,
             };
         } catch (err: any) {
+            // Proxy or network failure — mark proxy as failed
+            this.reportProxyResult(proxyUrl, false);
+
             const code = err?.code;
             const transient =
                 code === 'ECONNRESET' || code === 'ETIMEDOUT' ||
@@ -1416,12 +1786,25 @@ export class CmsDetectorService {
     }
 
     private readonly USER_AGENTS = [
+        // Chrome — Windows/Mac/Linux, multiple versions
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        // Firefox
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+        'Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0',
+        // Safari
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15',
+        // Edge
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0',
+        // Mobile (Android Chrome + iOS Safari)
+        'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
     ];
 
     private randomUserAgent(): string {

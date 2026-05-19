@@ -14,7 +14,7 @@ async function bootstrap() {
   app.setGlobalPrefix('api');
   app.useGlobalPipes(new ValidationPipe({
     whitelist: true,    // DTO da yo'q maydonlarni o'chiradi
-    transform: true,    // Turlarni avtomatik konvertatsiya qiladi
+      transform: true, // Turlarni avtomatik konvertatsiya qiladi
   }));
 
   // Default admin yaratish

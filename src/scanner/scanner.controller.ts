@@ -4,12 +4,14 @@ import {
   Param, Body, Query, HttpCode, UseGuards, Res,
 } from '@nestjs/common';
 import type { Response } from 'express';
+import axios from 'axios';
 import { ScannerService } from './scanner.service';
 import { SubdomainService } from './subdomain.service';
 import { WhoisService } from './whois.service';
 import { SiteInfoService } from './site-info.service';
 import { NucleiService } from './nuclei.service';
 import { ThreatIntelService } from './threat-intel.service';
+import { CmsDetectorService } from './cms-detector.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
@@ -27,7 +29,78 @@ export class ScannerController {
     private readonly prisma:       PrismaService,
     private readonly nuclei:       NucleiService,
     private readonly threatIntel:  ThreatIntelService,
+    private readonly cmsDetector:  CmsDetectorService,
   ) {}
+
+  @Get('proxies')
+  getProxies() { return this.cmsDetector.getProxyStats(); }
+
+  @Post('proxies/refresh')
+  @Roles('ADMIN', 'WORKER')
+  @HttpCode(200)
+  async refreshProxies() {
+    await this.cmsDetector.refreshProxies();
+    return this.cmsDetector.getProxyStats();
+  }
+
+  @Post('proxies/auto-refresh')
+  @Roles('ADMIN', 'WORKER')
+  @HttpCode(200)
+  setAutoRefresh(@Body() body: { enabled: boolean }) {
+    this.cmsDetector.setAutoRefreshEnabled(!!body?.enabled);
+    return this.cmsDetector.getProxyStats();
+  }
+
+  @Post('proxies/test')
+  @HttpCode(200)
+  async testProxy(@Body() body: { proxy?: string; index?: number }) {
+    return this.cmsDetector.testProxy(body || {});
+  }
+
+  private static ispCache: { data: any; exp: number } | null = null;
+
+  @Public()
+  @Get('isp')
+  async getIsp() {
+    const now = Date.now();
+    if (ScannerController.ispCache && ScannerController.ispCache.exp > now) {
+      return ScannerController.ispCache.data;
+    }
+    const empty = { isp: null, ip: null, country: null, city: null };
+
+    // ipwho.is — bepul, CORS, key kerak emas
+    try {
+      const r = await axios.get<any>('https://ipwho.is/', { timeout: 6000 });
+      if (r.data?.success !== false) {
+        const data = {
+          isp:     r.data?.connection?.isp || r.data?.connection?.org || null,
+          ip:      r.data?.ip      || null,
+          country: r.data?.country || null,
+          city:    r.data?.city    || null,
+        };
+        ScannerController.ispCache = { data, exp: now + 3_600_000 }; // 1h cache
+        return data;
+      }
+    } catch { /* fallback */ }
+
+    // Fallback: ip-api.com
+    try {
+      const r = await axios.get<any>('http://ip-api.com/json/', { timeout: 6000 });
+      if (r.data?.status === 'success') {
+        const data = {
+          isp:     r.data?.isp     || r.data?.org || null,
+          ip:      r.data?.query   || null,
+          country: r.data?.country || null,
+          city:    r.data?.city    || null,
+        };
+        ScannerController.ispCache = { data, exp: now + 3_600_000 };
+        return data;
+      }
+    } catch { /* fallback */ }
+
+    ScannerController.ispCache = { data: empty, exp: now + 300_000 }; // 5min cache for failure
+    return empty;
+  }
 
   // ── Hamma ko'ra oladi ────────────────────────────
   @Get('results')
