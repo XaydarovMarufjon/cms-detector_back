@@ -69,14 +69,28 @@ export class CallsService implements OnModuleInit {
     if (!cat) throw new NotFoundException();
 
     const update: { name?: string; color?: string } = {};
+    let renameFrom: string | null = null;
+    let renameTo:   string | null = null;
+
     if (data.name !== undefined) {
       const trimmed = data.name.trim();
       if (!trimmed) throw new ConflictException('Kategoriya nomi bo\'sh');
-      update.name = trimmed;
+      if (trimmed !== cat.name) {
+        update.name = trimmed;
+        renameFrom = cat.name;
+        renameTo   = trimmed;
+      }
     }
     if (data.color !== undefined) update.color = assertColor(data.color);
 
     try {
+      if (renameFrom && renameTo) {
+        const [updated] = await this.prisma.$transaction([
+          this.prisma.callCategory.update({ where: { id }, data: update }),
+          this.prisma.call.updateMany({ where: { category: renameFrom }, data: { category: renameTo } }),
+        ]);
+        return updated;
+      }
       return await this.prisma.callCategory.update({ where: { id }, data: update });
     } catch {
       throw new ConflictException('Yangilab bo\'lmadi (nom band yoki xato)');
