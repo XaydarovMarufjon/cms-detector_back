@@ -16,7 +16,49 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  sessions  Session[]
+  auditLogs AuditLog[]
+
   @@map("users")
+}
+
+model Session {
+  id            String    @id @default(uuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jti           String    @unique
+  ip            String?
+  userAgent     String?
+  device        String?
+  lastActiveAt  DateTime  @default(now())
+  createdAt     DateTime  @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+
+  @@index([userId])
+  @@index([lastActiveAt])
+  @@map("sessions")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  username  String?
+  action    String
+  method    String?
+  path      String?
+  targetId  String?
+  metadata  Json?
+  ip        String?
+  userAgent String?
+  device    String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([userId])
+  @@index([action])
+  @@map("audit_logs")
 }
 
 enum Role {
