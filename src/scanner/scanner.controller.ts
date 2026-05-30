@@ -127,9 +127,14 @@ export class ScannerController {
     return this.siteInfo.analyze(url, websiteId);
   }
 
+  @Get('subdomains/cache')
+  getCachedSubdomains(@Query('domain') domain: string) {
+    return this.subdomains.getCachedAlive(domain);
+  }
+
   @Get('subdomains')
-  discoverSubdomains(@Query('domain') domain: string) {
-    return this.subdomains.discover(domain);
+  discoverSubdomains(@Query('domain') domain: string, @Query('websiteId') websiteId?: string) {
+    return this.subdomains.discover(domain, websiteId);
   }
 
   @Get('websites')

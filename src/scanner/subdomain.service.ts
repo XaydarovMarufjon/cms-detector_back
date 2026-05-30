@@ -1,9 +1,9 @@
 // src/scanner/subdomain.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import axios from 'axios';
-import { promises as dns } from 'dns';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { PrismaService } from '../prisma/prisma.service';
 
 const execFileAsync = promisify(execFile);
 
@@ -13,13 +13,40 @@ export interface SubdomainResult {
     source: string[];
     statusCode?: number;
     title?: string;
+    cached?: boolean;
+    discoveredAt?: Date;
 }
 
 @Injectable()
 export class SubdomainService {
     private readonly logger = new Logger(SubdomainService.name);
 
-    async discover(domain: string): Promise<SubdomainResult[]> {
+    constructor(private readonly prisma: PrismaService) {}
+
+    async getCachedAlive(domain: string): Promise<SubdomainResult[]> {
+        const normalized = this.normalizeDomain(domain);
+        if (!normalized) return [];
+
+        const rows = await this.prisma.subdomainCache.findMany({
+            where: { domain: normalized },
+            orderBy: { subdomain: 'asc' },
+        });
+
+        return rows.map(row => ({
+            subdomain: row.subdomain,
+            alive: true,
+            source: row.source,
+            statusCode: row.statusCode ?? undefined,
+            title: row.title ?? undefined,
+            cached: true,
+            discoveredAt: row.discoveredAt,
+        }));
+    }
+
+    async discover(domain: string, websiteId?: string): Promise<SubdomainResult[]> {
+        domain = this.normalizeDomain(domain);
+        if (!domain) return [];
+
         const [crtShResult, subfinderResult] = await Promise.allSettled([
             this.fromCrtSh(domain),
             this.fromSubfinder(domain),
@@ -66,10 +93,51 @@ export class SubdomainService {
         }
 
         // Alive first, then dead — alphabetical within each group
-        return results.sort((a, b) => {
+        const sorted = results.sort((a, b) => {
             if (a.alive !== b.alive) return a.alive ? -1 : 1;
             return a.subdomain.localeCompare(b.subdomain);
         });
+
+        await this.saveAlive(domain, sorted, websiteId);
+        return sorted;
+    }
+
+    private async saveAlive(domain: string, results: SubdomainResult[], websiteId?: string) {
+        const alive = results.filter(r => r.alive);
+
+        try {
+            await this.prisma.$transaction([
+                this.prisma.subdomainCache.deleteMany({ where: { domain } }),
+                ...(alive.length
+                    ? [this.prisma.subdomainCache.createMany({
+                        data: alive.map(r => ({
+                            websiteId,
+                            domain,
+                            subdomain: r.subdomain,
+                            source: r.source,
+                            statusCode: r.statusCode,
+                            title: r.title,
+                        })),
+                    })]
+                    : []),
+            ]);
+        } catch (err) {
+            this.logger.warn(`subdomain cache save failed for ${domain}: ${String(err)}`);
+        }
+    }
+
+    private normalizeDomain(input: string): string {
+        const raw = (input || '').trim().toLowerCase();
+        if (!raw) return '';
+        try {
+            const url = raw.startsWith('http') ? raw : `https://${raw}`;
+            return new URL(url).hostname.replace(/^www\./, '');
+        } catch {
+            return raw
+                .replace(/^https?:\/\//, '')
+                .split('/')[0]
+                .replace(/^www\./, '');
+        }
     }
 
     // ── crt.sh certificate transparency log ──────────────────────────────────
@@ -122,34 +190,14 @@ export class SubdomainService {
         return [];
     }
 
-    // ── httpx-based host probe (alive + statusCode + title) ──────────────────
+    // ── host probe (alive + statusCode + title) ──────────────────────────────
     private async probeHost(hostname: string): Promise<{ alive: boolean; statusCode?: number; title?: string }> {
-        // Try httpx first (more accurate)
+        // Try ProjectDiscovery httpx first. If it cannot resolve/probe a host,
+        // fall back to axios instead of marking the host dead immediately.
         const httpxResult = await this.probeWithHttpx(hostname);
-        if (httpxResult !== null) return httpxResult;
+        if (httpxResult?.alive) return httpxResult;
 
-        // Fallback: DNS + axios HEAD
-        try {
-            await dns.resolve(hostname);
-        } catch {
-            return { alive: false };
-        }
-
-        for (const scheme of ['https', 'http']) {
-            try {
-                const res = await axios.head(`${scheme}://${hostname}`, {
-                    timeout: 8000,
-                    maxRedirects: 5,
-                    validateStatus: () => true,
-                    headers: { 'User-Agent': 'cms-radar/1.0' },
-                });
-                return { alive: true, statusCode: res.status };
-            } catch {
-                // try next scheme
-            }
-        }
-
-        return { alive: false };
+        return this.probeWithAxios(hostname);
     }
 
     private async probeWithHttpx(hostname: string): Promise<{ alive: boolean; statusCode?: number; title?: string } | null> {
@@ -164,23 +212,77 @@ export class SubdomainService {
             try {
                 const { stdout } = await execFileAsync(
                     bin,
-                    ['-u', hostname, '-silent', '-status-code', '-title', '-json', '-timeout', '8'],
+                    ['-u', hostname, '-silent', '-probe', '-status-code', '-title', '-json', '-timeout', '8'],
                     { timeout: 15_000 },
                 );
-                const line = stdout.trim().split('\n')[0];
-                if (!line) return { alive: false };
+                const line = stdout
+                    .split('\n')
+                    .map(l => l.trim())
+                    .find(l => l.startsWith('{'));
+                if (!line) return null;
                 const parsed = JSON.parse(line);
+                if (parsed.failed || parsed.error) return null;
+                const statusCode = parsed['status-code'] ?? parsed.status_code;
                 return {
-                    alive: true,
-                    statusCode: parsed['status-code'] ?? parsed.status_code,
+                    alive: statusCode ? statusCode > 0 : true,
+                    statusCode,
                     title: parsed.title,
                 };
             } catch (err: any) {
                 if (err?.code === 'ENOENT') continue;
-                // httpx found but failed = host is dead or error
-                return { alive: false };
+                this.logger.debug?.(`httpx probe failed for ${hostname}: ${String(err?.message || err)}`);
+                return null;
             }
         }
         return null; // httpx not found, fall back to axios
+    }
+
+    private async probeWithAxios(hostname: string): Promise<{ alive: boolean; statusCode?: number; title?: string }> {
+        for (const scheme of ['https', 'http']) {
+            const url = `${scheme}://${hostname}`;
+            const head = await this.request(url, 'HEAD');
+            if (head) return head;
+
+            const get = await this.request(url, 'GET');
+            if (get) return get;
+        }
+        return { alive: false };
+    }
+
+    private async request(
+        url: string,
+        method: 'HEAD' | 'GET',
+    ): Promise<{ alive: boolean; statusCode?: number; title?: string } | null> {
+        try {
+            const res = await axios.request<string>({
+                url,
+                method,
+                timeout: 10_000,
+                maxRedirects: 5,
+                maxContentLength: 512 * 1024,
+                responseType: 'text',
+                validateStatus: () => true,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (compatible; cms-radar/1.0)',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                },
+            });
+
+            return {
+                alive: true,
+                statusCode: res.status,
+                title: method === 'GET' && typeof res.data === 'string'
+                    ? this.extractTitle(res.data)
+                    : undefined,
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    private extractTitle(html: string): string | undefined {
+        const match = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+        if (!match) return undefined;
+        return match[1].replace(/\s+/g, ' ').trim().slice(0, 120) || undefined;
     }
 }
