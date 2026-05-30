@@ -1,4 +1,4 @@
-import { Injectable, Logger, forwardRef, Inject } from '@nestjs/common';
+import { Injectable, InternalServerErrorException, Logger, forwardRef, Inject } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import { CronJob } from 'cron';
 import { execFile } from 'child_process';
@@ -28,6 +28,7 @@ const SEVERITY_ORDER: Record<string, number> = {
 
 const NUCLEI_BINS = [
   'nuclei',
+  '/opt/homebrew/bin/nuclei',
   '/usr/local/bin/nuclei',
   '/usr/bin/nuclei',
   `${process.env['HOME']}/go/bin/nuclei`,
@@ -144,7 +145,7 @@ export class NucleiService {
         } catch { /* ignore */ }
       }
 
-      const targets = websites.map(s => s.url);
+      const targets = this.normalizeTargets(websites.map(s => s.url));
 
       // Show first site as "current" while full scan runs
       this.progress.currentSite  = `${websites.length} ta sayt skanlanmoqda...`;
@@ -270,9 +271,7 @@ export class NucleiService {
   ): Promise<NucleiHit[]> {
     if (!subdomains.length) return [];
 
-    const targets = subdomains.map(s =>
-      s.startsWith('http') ? s : `https://${s}`,
-    );
+    const targets = this.expandTargets(subdomains);
 
     const hits = await this.runNuclei(targets);
 
@@ -330,6 +329,8 @@ export class NucleiService {
   // ── NUCLEI BINARY ─────────────────────────────────────────────────────────
 
   private async runNuclei(targets: string[]): Promise<NucleiHit[]> {
+    if (!targets.length) return [];
+
     const tmpFile = join(tmpdir(), `nuclei-${randomUUID()}.txt`);
     try {
       await writeFile(tmpFile, targets.join('\n'), 'utf8');
@@ -348,21 +349,26 @@ export class NucleiService {
               '-silent',
               '-no-color',
               '-timeout', '10',
+              '-retries', '1',
               '-rl',      '100',  // rate-limit req/s
               '-bs',      '25',   // bulk-size
               '-c',       '25',   // concurrency
+              '-or',              // omit raw request/response from JSONL
+              '-duc',             // disable update checks in API-triggered scans
+              '-no-stdin',
             ],
-            { timeout: timeoutMs },
+            { timeout: timeoutMs, maxBuffer: 20 * 1024 * 1024 },
           );
           return this.parse(stdout);
         } catch (err: any) {
           if (err?.code === 'ENOENT') continue;
           this.logger.warn(`nuclei error: ${String(err)}`);
-          if (err?.stdout) return this.parse(err.stdout as string);
-          return [];
+          const hits = err?.stdout ? this.parse(err.stdout as string) : [];
+          if (hits.length) return hits;
+          throw new InternalServerErrorException(this.formatNucleiError(err));
         }
       }
-      throw new Error(
+      throw new InternalServerErrorException(
         'nuclei not found. Install: go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest',
       );
     } finally {
@@ -401,5 +407,32 @@ export class NucleiService {
   private extractHost(url: string): string {
     try   { return new URL(url).hostname; }
     catch { return url.replace(/^https?:\/\//, '').split('/')[0]; }
+  }
+
+  private normalizeTargets(targets: string[]): string[] {
+    return [...new Set(
+      targets
+        .map(t => t.trim())
+        .filter(Boolean)
+        .map(t => t.startsWith('http://') || t.startsWith('https://') ? t : `https://${t}`)
+        .map(t => t.replace(/\/$/, '')),
+    )];
+  }
+
+  private expandTargets(targets: string[]): string[] {
+    const expanded = targets.flatMap(raw => {
+      const t = raw.trim().replace(/\/$/, '');
+      if (!t) return [];
+      if (t.startsWith('http://') || t.startsWith('https://')) return [t];
+      return [`https://${t}`, `http://${t}`];
+    });
+    return [...new Set(expanded)];
+  }
+
+  private formatNucleiError(err: any): string {
+    const stderr = String(err?.stderr || '').trim();
+    const message = String(err?.message || '').trim();
+    const details = stderr || message || 'nuclei scan failed';
+    return details.split('\n').slice(-4).join('\n');
   }
 }
