@@ -47,6 +47,9 @@ export class ScannerController {
   @Get('overview-stats')
   getOverviewStats() { return this.overviewStats.getStats(); }
 
+  @Get('live-scan-activity')
+  getLiveScanActivity() { return this.scanner.getLiveScanActivity(); }
+
   @Post('proxies/refresh')
   @Roles('ADMIN', 'WORKER')
   @HttpCode(200)

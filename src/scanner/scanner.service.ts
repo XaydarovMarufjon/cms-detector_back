@@ -3,6 +3,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import { CronJob } from 'cron';
 import axios from 'axios';
+import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { CmsDetectorService, type CmsDetectOptions, type CmsDetectionResult } from './cms-detector.service';
 import { WhoisService } from './whois.service';
@@ -19,6 +20,26 @@ export interface BulkScanStartOptions {
   timeoutMs?: number;
   includeRecentlyScanned?: boolean;
   skipRecentHours?: number;
+}
+
+export type LiveScanSource = 'MANUAL' | 'SCAN_ALL' | 'AUTO' | 'BULK' | 'RETRY';
+export type LiveScanStatus = 'RUNNING' | 'DONE' | 'FAILED';
+
+export interface LiveScanItem {
+  id: string;
+  websiteId: string;
+  url: string;
+  label: string | null;
+  source: LiveScanSource;
+  mode: BulkScanMode;
+  status: LiveScanStatus;
+  startedAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  error: string | null;
+  cms: string | null;
+  httpStatus: number | null;
 }
 
 interface BulkScanRuntime {
@@ -52,9 +73,12 @@ export class ScannerService implements OnModuleInit {
   private readonly AUTO_SCAN_KEY = 'cms-auto-scan';
   private readonly AUTO_SCAN_CONCURRENCY = Math.min(50, Math.max(1, Number(process.env['AUTO_SCAN_CONCURRENCY'] || 16)));
   private readonly AUTO_SCAN_TIMEOUT_MS = Math.min(15_000, Math.max(2_000, Number(process.env['AUTO_SCAN_TIMEOUT_MS'] || 5_000)));
+  private readonly LIVE_SCAN_VISIBLE_MS = 10_000;
   private currentInterval = 360; // daqiqa (default: 6 soat)
   private autoScanRunning = false;
   private activeBulkJob: BulkScanRuntime | null = null;
+  private liveScans = new Map<string, LiveScanItem>();
+  private recentLiveScans: LiveScanItem[] = [];
 
   constructor(
     private readonly prisma: PrismaService,
@@ -253,7 +277,7 @@ export class ScannerService implements OnModuleInit {
 
   private async scanAutoSite(websiteId: string, url: string) {
     try {
-      await this.scanOne(websiteId, url, { mode: 'FAST', timeoutMs: this.AUTO_SCAN_TIMEOUT_MS });
+      await this.scanOne(websiteId, url, { mode: 'FAST', timeoutMs: this.AUTO_SCAN_TIMEOUT_MS, liveSource: 'AUTO' });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.warn(`Auto scan item failed: ${url} ${message}`);
@@ -297,7 +321,7 @@ export class ScannerService implements OnModuleInit {
     const firstPass = await Promise.all(
       sites.map(site =>
         limit(async () => {
-          const r = await this.scanOne(site.id, site.url);
+          const r = await this.scanOne(site.id, site.url, { liveSource: 'SCAN_ALL' });
           await new Promise(res => setTimeout(res, 200));
           return { site, result: r };
         })
@@ -309,7 +333,7 @@ export class ScannerService implements OnModuleInit {
     const failed = firstPass.filter(p => p.result?.httpStatus == null && !p.result?.cms);
     for (const { site } of failed) {
       try {
-        await this.scanOne(site.id, site.url);
+        await this.scanOne(site.id, site.url, { liveSource: 'RETRY' });
         await new Promise(res => setTimeout(res, 400));
       } catch { /* ignore */ }
     }
@@ -506,6 +530,7 @@ export class ScannerService implements OnModuleInit {
       const saved = await this.scanOne(item.websiteId, item.url, {
         mode: config.mode,
         timeoutMs: config.timeoutMs,
+        liveSource: 'BULK',
       });
 
       await this.prisma.bulkScanJobItem.update({
@@ -637,7 +662,13 @@ export class ScannerService implements OnModuleInit {
   }
 
   // ── SCAN ONE ──────────────────────────────────────────────────────────────
-  async scanOne(websiteId: string, url: string, options: CmsDetectOptions = {}) {
+  async scanOne(websiteId: string, url: string, options: CmsDetectOptions & { liveSource?: LiveScanSource } = {}) {
+    const liveId = this.beginLiveScan(
+      websiteId,
+      url,
+      options.liveSource ?? 'MANUAL',
+      options.mode === 'FAST' ? 'FAST' : 'FULL',
+    );
     const host = this.extractHost(url);
     try {
       const result = await this.detector.detect(url, options);
@@ -684,6 +715,10 @@ export class ScannerService implements OnModuleInit {
         this.logger.warn(`Defacement check failed: ${url} ${message}`);
       });
 
+      this.finishLiveScan(liveId, saved.errorMessage ? 'FAILED' : 'DONE', saved.errorMessage, {
+        cms: saved.cms,
+        httpStatus: saved.httpStatus,
+      });
       return saved;
     } catch (err) {
       let message = 'Unknown error';
@@ -692,9 +727,222 @@ export class ScannerService implements OnModuleInit {
       // Site is unreachable
       this.alerts.checkSiteDown(host, null, websiteId).catch(() => {});
 
-      return this.prisma.scanResult.create({
+      const saved = await this.prisma.scanResult.create({
         data: { websiteId, errorMessage: message },
       });
+      this.finishLiveScan(liveId, 'FAILED', message);
+      return saved;
+    }
+  }
+
+  private beginLiveScan(
+    websiteId: string,
+    url: string,
+    source: LiveScanSource,
+    mode: BulkScanMode,
+  ): string {
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    this.liveScans.set(id, {
+      id,
+      websiteId,
+      url,
+      label: null,
+      source,
+      mode,
+      status: 'RUNNING',
+      startedAt: now,
+      updatedAt: now,
+      finishedAt: null,
+      durationMs: null,
+      error: null,
+      cms: null,
+      httpStatus: null,
+    });
+    return id;
+  }
+
+  private finishLiveScan(
+    id: string,
+    status: LiveScanStatus,
+    error: string | null = null,
+    result: { cms?: string | null; httpStatus?: number | null } = {},
+  ) {
+    const current = this.liveScans.get(id);
+    if (!current) return;
+
+    const finishedAt = new Date();
+    const startedAt = new Date(current.startedAt).getTime();
+    const durationMs = Number.isFinite(startedAt) ? finishedAt.getTime() - startedAt : null;
+    const item: LiveScanItem = {
+      ...current,
+      status,
+      updatedAt: finishedAt.toISOString(),
+      finishedAt: finishedAt.toISOString(),
+      durationMs,
+      error,
+      cms: result.cms ?? current.cms,
+      httpStatus: result.httpStatus ?? current.httpStatus,
+    };
+
+    this.liveScans.set(id, item);
+    this.rememberRecentLiveScan(item);
+
+    const timer = setTimeout(() => {
+      const current = this.liveScans.get(id);
+      if (current?.status !== 'RUNNING') this.liveScans.delete(id);
+    }, this.LIVE_SCAN_VISIBLE_MS);
+    timer.unref?.();
+  }
+
+  private rememberRecentLiveScan(item: LiveScanItem) {
+    this.recentLiveScans = [item, ...this.recentLiveScans.filter(row => row.id !== item.id)].slice(0, 20);
+  }
+
+  async getLiveScanActivity() {
+    this.purgeFinishedLiveScans();
+
+    const [bulkJob, autoScan, runningBulkItems, recentBulkItems, recentDb] = await Promise.all([
+      this.getCurrentBulkScanJob(),
+      this.prisma.autoScanState.findUnique({ where: { key: this.AUTO_SCAN_KEY } }),
+      this.prisma.bulkScanJobItem.findMany({
+        where: { status: 'RUNNING' },
+        orderBy: { startedAt: 'desc' },
+        take: 20,
+        include: {
+          website: { select: { url: true, label: true } },
+          job: { select: { mode: true } },
+        },
+      }),
+      this.prisma.bulkScanJobItem.findMany({
+        where: { status: { in: ['DONE', 'FAILED'] }, finishedAt: { not: null } },
+        orderBy: { finishedAt: 'desc' },
+        take: 12,
+        include: {
+          website: { select: { url: true, label: true } },
+          job: { select: { mode: true } },
+        },
+      }),
+      this.prisma.scanResult.findMany({
+        orderBy: { scannedAt: 'desc' },
+        take: 12,
+        include: { website: { select: { url: true, label: true } } },
+      }),
+    ]);
+
+    const memoryActive = [...this.liveScans.values()];
+    const activeKeys = new Set(memoryActive.map(item => `${item.source}:${item.websiteId}`));
+    const dbActive = runningBulkItems
+      .filter(item => !activeKeys.has(`BULK:${item.websiteId}`))
+      .map(item => ({
+        id: `bulk-running-${item.id}`,
+        websiteId: item.websiteId,
+        url: item.website?.url ?? item.url,
+        label: item.website?.label ?? null,
+        source: 'BULK',
+        mode: item.job.mode as BulkScanMode,
+        status: 'RUNNING',
+        startedAt: item.startedAt?.toISOString() ?? item.updatedAt.toISOString(),
+        updatedAt: item.updatedAt.toISOString(),
+        finishedAt: null,
+        durationMs: null,
+        error: item.errorMessage,
+        cms: null,
+        httpStatus: null,
+      }));
+    const active = [...memoryActive, ...dbActive].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+    const memoryRecent = this.recentLiveScans.map(item => ({
+      ...item,
+      label: item.label ?? null,
+    }));
+    const bulkRecent = recentBulkItems.map(item => {
+      const startedAt = item.startedAt?.getTime();
+      const finishedAt = item.finishedAt?.getTime();
+      const durationMs =
+        startedAt !== undefined && finishedAt !== undefined && Number.isFinite(startedAt) && Number.isFinite(finishedAt)
+          ? Math.max(0, finishedAt - startedAt)
+          : null;
+      return {
+        id: `bulk-history-${item.id}`,
+        websiteId: item.websiteId,
+        url: item.website?.url ?? item.url,
+        label: item.website?.label ?? null,
+        source: 'BULK',
+        mode: item.job.mode as BulkScanMode,
+        status: item.status === 'FAILED' ? 'FAILED' : 'DONE',
+        startedAt: item.startedAt?.toISOString() ?? null,
+        updatedAt: item.updatedAt.toISOString(),
+        finishedAt: item.finishedAt?.toISOString() ?? null,
+        durationMs,
+        error: item.errorMessage,
+        cms: null,
+        httpStatus: null,
+      };
+    });
+    const dbRecent = recentDb.map(row => ({
+      id: `history-${row.id}`,
+      websiteId: row.websiteId,
+      url: row.website?.url ?? '',
+      label: row.website?.label ?? null,
+      source: 'HISTORY',
+      mode: 'FULL',
+      status: row.errorMessage ? 'FAILED' : 'DONE',
+      startedAt: row.scannedAt.toISOString(),
+      updatedAt: row.scannedAt.toISOString(),
+      finishedAt: row.scannedAt.toISOString(),
+      durationMs: null,
+      error: row.errorMessage,
+      cms: row.cms,
+      httpStatus: row.httpStatus,
+    }));
+
+    return {
+      generatedAt: new Date().toISOString(),
+      active,
+      lastScanDurationMs: this.getLastScanDurationMs(memoryRecent, bulkRecent),
+      recent: [...memoryRecent, ...bulkRecent, ...dbRecent]
+        .sort((a, b) => {
+          const aTime = new Date(a.finishedAt || a.updatedAt || a.startedAt || 0).getTime();
+          const bTime = new Date(b.finishedAt || b.updatedAt || b.startedAt || 0).getTime();
+          return bTime - aTime;
+        })
+        .slice(0, 12),
+      bulkJob,
+      autoScan: autoScan
+        ? {
+          intervalMinutes: autoScan.intervalMinutes,
+          lastStatus: autoScan.lastStatus,
+          scannedInLastWindow: autoScan.scannedInLastWindow,
+          totalAtLastWindow: autoScan.totalAtLastWindow,
+          lastStartedAt: autoScan.lastStartedAt?.toISOString() ?? null,
+          lastFinishedAt: autoScan.lastFinishedAt?.toISOString() ?? null,
+        }
+        : null,
+    };
+  }
+
+  private getLastScanDurationMs(
+    memoryRecent: Array<{ durationMs: number | null; finishedAt: string | null }>,
+    bulkRecent: Array<{ durationMs: number | null; finishedAt: string | null }>,
+  ): number | null {
+    const rows = [...memoryRecent, ...bulkRecent]
+      .filter(item => item.durationMs != null)
+      .sort((a, b) => {
+        const aTime = new Date(a.finishedAt || 0).getTime();
+        const bTime = new Date(b.finishedAt || 0).getTime();
+        return bTime - aTime;
+      });
+    return rows[0]?.durationMs ?? null;
+  }
+
+  private purgeFinishedLiveScans() {
+    const now = Date.now();
+    for (const [id, item] of this.liveScans) {
+      if (item.status === 'RUNNING') continue;
+      const finishedAt = item.finishedAt ? new Date(item.finishedAt).getTime() : 0;
+      if (!Number.isFinite(finishedAt) || now - finishedAt > this.LIVE_SCAN_VISIBLE_MS) {
+        this.liveScans.delete(id);
+      }
     }
   }
 

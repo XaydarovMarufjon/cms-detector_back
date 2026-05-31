@@ -63,6 +63,29 @@ model AuditLog {
   @@map("audit_logs")
 }
 
+model DatabaseDump {
+  id              String    @id @default(uuid())
+  filename        String
+  filePath        String
+  format          String    @default("custom")
+  status          String    @default("RUNNING")
+  trigger         String    @default("MANUAL")
+  sizeBytes       BigInt?
+  checksumSha256  String?
+  errorMessage    String?
+  createdById     String?
+  createdByName   String?
+  startedAt       DateTime  @default(now())
+  finishedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([status])
+  @@index([trigger])
+  @@index([startedAt])
+  @@map("db_dumps")
+}
+
 enum Role {
   ADMIN
   WORKER
