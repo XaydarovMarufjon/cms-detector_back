@@ -10,6 +10,10 @@ import { WhoisService } from './whois.service';
 import { SiteInfoService } from './site-info.service';
 import { NucleiService } from './nuclei.service';
 import { ThreatIntelService } from './threat-intel.service';
+import { PortScannerService } from './port-scanner.service';
+import { SystemStatusService } from './system-status.service';
+import { OverviewStatsService } from './overview-stats.service';
+import { CveCorrelationService } from './cve-correlation.service';
 
 @Module({
   imports: [
@@ -18,6 +22,6 @@ import { ThreatIntelService } from './threat-intel.service';
     AlertsModule,
   ],
   controllers: [ScannerController],
-  providers: [ScannerService, CmsDetectorService, SubdomainService, WhoisService, SiteInfoService, NucleiService, ThreatIntelService],
+  providers: [ScannerService, CmsDetectorService, SubdomainService, WhoisService, SiteInfoService, NucleiService, ThreatIntelService, PortScannerService, SystemStatusService, OverviewStatsService, CveCorrelationService],
 })
 export class ScannerModule { }

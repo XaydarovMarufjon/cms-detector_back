@@ -12,6 +12,9 @@ import { SiteInfoService } from './site-info.service';
 import { NucleiService } from './nuclei.service';
 import { ThreatIntelService } from './threat-intel.service';
 import { CmsDetectorService } from './cms-detector.service';
+import { PortScannerService } from './port-scanner.service';
+import { SystemStatusService } from './system-status.service';
+import { OverviewStatsService } from './overview-stats.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
@@ -30,10 +33,19 @@ export class ScannerController {
     private readonly nuclei:       NucleiService,
     private readonly threatIntel:  ThreatIntelService,
     private readonly cmsDetector:  CmsDetectorService,
+    private readonly portScanner:  PortScannerService,
+    private readonly systemStatus: SystemStatusService,
+    private readonly overviewStats: OverviewStatsService,
   ) {}
 
   @Get('proxies')
   getProxies() { return this.cmsDetector.getProxyStats(); }
+
+  @Get('system-status')
+  getSystemStatus() { return this.systemStatus.getStatus(); }
+
+  @Get('overview-stats')
+  getOverviewStats() { return this.overviewStats.getStats(); }
 
   @Post('proxies/refresh')
   @Roles('ADMIN', 'WORKER')
@@ -142,6 +154,16 @@ export class ScannerController {
     return this.prisma.website.findMany({ orderBy: { createdAt: 'desc' } });
   }
 
+  @Get('url-checker-sites')
+  getUrlCheckerSites() {
+    return this.prisma.urlCheckerSite.findMany({ orderBy: { createdAt: 'desc' } });
+  }
+
+  @Get('ports/:websiteId')
+  getPortScanResults(@Param('websiteId') websiteId: string) {
+    return this.portScanner.getLatest(websiteId);
+  }
+
   // ── Interval sozlash ─────────────────────────────
   @Get('interval')
   getInterval() { return this.scanner.getInterval(); }
@@ -165,6 +187,46 @@ export class ScannerController {
   @HttpCode(200)
   scanAll() { return this.scanner.scanAll(); }
 
+  @Post('bulk-scan/start')
+  @Roles('ADMIN', 'WORKER')
+  @HttpCode(200)
+  startBulkScan(@Body() body: {
+    mode?: 'FAST' | 'FULL';
+    concurrency?: number;
+    timeoutMs?: number;
+    includeRecentlyScanned?: boolean;
+    skipRecentHours?: number;
+  }) {
+    return this.scanner.startBulkScan(body || {});
+  }
+
+  @Get('bulk-scan/current')
+  getCurrentBulkScan() {
+    return this.scanner.getCurrentBulkScanJob();
+  }
+
+  @Get('bulk-scan/:id')
+  getBulkScan(@Param('id') id: string) {
+    return this.scanner.getBulkScanJob(id);
+  }
+
+  @Post('bulk-scan/:id/cancel')
+  @Roles('ADMIN', 'WORKER')
+  @HttpCode(200)
+  cancelBulkScan(@Param('id') id: string) {
+    return this.scanner.cancelBulkScan(id);
+  }
+
+  @Post('ports/:websiteId')
+  @Roles('ADMIN', 'WORKER')
+  @HttpCode(200)
+  scanPorts(
+    @Param('websiteId') websiteId: string,
+    @Body() body: { host?: string; ports?: number[]; timeoutMs?: number },
+  ) {
+    return this.portScanner.scanWebsite(websiteId, body);
+  }
+
   @Post('websites')
   @Roles('ADMIN', 'WORKER')
   createWebsite(@Body() body: { url: string; label?: string }) {
@@ -175,6 +237,33 @@ export class ScannerController {
   @Roles('ADMIN', 'WORKER')
   updateWebsite(@Param('id') id: string, @Body() body: { url?: string; label?: string }) {
     return this.prisma.website.update({ where: { id }, data: body });
+  }
+
+  @Post('url-checker-sites')
+  @Roles('ADMIN', 'WORKER')
+  createUrlCheckerSite(@Body() body: { url: string; label?: string | null }) {
+    return this.prisma.urlCheckerSite.create({
+      data: {
+        url: body.url.trim(),
+        label: body.label?.trim() || null,
+      },
+    });
+  }
+
+  @Patch('url-checker-sites/:id')
+  @Roles('ADMIN', 'WORKER')
+  updateUrlCheckerSite(@Param('id') id: string, @Body() body: { url?: string; label?: string | null }) {
+    const data: { url?: string; label?: string | null } = {};
+    if (typeof body.url === 'string') data.url = body.url.trim();
+    if ('label' in body) data.label = body.label?.trim() || null;
+
+    return this.prisma.urlCheckerSite.update({ where: { id }, data });
+  }
+
+  @Delete('url-checker-sites/:id')
+  @Roles('ADMIN', 'WORKER')
+  deleteUrlCheckerSite(@Param('id') id: string) {
+    return this.prisma.urlCheckerSite.delete({ where: { id } });
   }
 
   // ── Nuclei CVE skan ──────────────────────────────

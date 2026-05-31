@@ -66,7 +66,10 @@ export class SubdomainService {
         if (crtShResult.status === 'fulfilled')    merge(crtShResult.value,    'crt.sh');
         if (subfinderResult.status === 'fulfilled') merge(subfinderResult.value, 'subfinder');
 
-        if (!sourceMap.size) return [];
+        if (!sourceMap.size) {
+            await this.markScanCompleted(websiteId);
+            return [];
+        }
 
         // Check alive status — keep ALL results, just mark alive/dead
         const entries = [...sourceMap.entries()];
@@ -99,7 +102,20 @@ export class SubdomainService {
         });
 
         await this.saveAlive(domain, sorted, websiteId);
+        await this.markScanCompleted(websiteId);
         return sorted;
+    }
+
+    private async markScanCompleted(websiteId?: string) {
+        if (!websiteId) return;
+        try {
+            await this.prisma.website.update({
+                where: { id: websiteId },
+                data: { subdomainsScannedAt: new Date() },
+            });
+        } catch (err) {
+            this.logger.warn(`subdomain scan completion save failed for ${websiteId}: ${String(err)}`);
+        }
     }
 
     private async saveAlive(domain: string, results: SubdomainResult[], websiteId?: string) {

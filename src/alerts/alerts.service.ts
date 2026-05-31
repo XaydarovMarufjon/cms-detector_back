@@ -23,8 +23,8 @@ function daysUntil(d: Date): number {
 
 function resolveType(days: number): string | null {
   if (days <= 10)  return 'expiry_urgent';
-  if (days <= 30)  return 'expiry_critical';
-  if (days <= 40)  return 'expiry_warning';
+  if (days <= 20)  return 'expiry_critical';
+  if (days <= 30)  return 'expiry_warning';
   return null;
 }
 
@@ -78,6 +78,14 @@ export class AlertsService {
     const message = `${domain}: Sayt ishlamayapti (${status})`;
     const dueDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
     await this.upsertAlert({ domain, type: 'site_down', message, dueDate, websiteId });
+  }
+
+  // Defacement / content integrity alert
+  async checkDefacementChange(domain: string, score: number, reasons: string[], websiteId?: string) {
+    const detail = reasons.slice(0, 4).join(', ') || 'kontent fingerprint o\'zgardi';
+    const message = `${domain}: Defacement gumoni — score ${score}/100 (${detail})`;
+    const dueDate = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000);
+    await this.upsertAlert({ domain, type: 'defacement_change', message, dueDate, websiteId });
   }
 
   private async upsertAlert(data: {

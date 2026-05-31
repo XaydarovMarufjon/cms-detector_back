@@ -10,6 +10,7 @@ import { AlertsModule } from './alerts/alerts.module';
 import { CallsModule } from './calls/calls.module';
 import { LogsModule } from './logs/logs.module';
 import { AuditInterceptor } from './logs/audit.interceptor';
+import { TasksModule } from './tasks/tasks.module';
 
 @Module({
   imports: [
@@ -20,6 +21,7 @@ import { AuditInterceptor } from './logs/audit.interceptor';
     ScannerModule,
     AlertsModule,
     CallsModule,
+    TasksModule,
   ],
   controllers: [AppController],
   providers: [

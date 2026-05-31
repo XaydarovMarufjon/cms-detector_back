@@ -3,8 +3,16 @@ import axios, { AxiosResponse } from 'axios';
 import * as cheerio from 'cheerio';
 import * as http from 'http';
 import * as https from 'https';
+import { createHash } from 'crypto';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { HttpsProxyAgent } from 'https-proxy-agent';
+import {
+    JS_BUNDLE_FINGERPRINTS,
+    STRONG_PATTERN_ONLY_TECHS,
+    SUPPLEMENTAL_CMS_FILE_PROBES,
+    WAPPALYZER_STYLE_FINGERPRINTS,
+    WappalyzerStylePattern,
+} from './cms-fingerprints';
 
 interface ProxySourceStatus {
   url:        string;
@@ -14,6 +22,23 @@ interface ProxySourceStatus {
   error?:     string;
   fetchedAt:  string;
 }
+
+interface ProxySourceConfig {
+    protocol: string;
+    url: string;
+}
+
+const DEFAULT_PROXY_SOURCES: ProxySourceConfig[] = [
+    { protocol: 'http', url: 'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt' },
+    { protocol: 'socks4', url: 'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt' },
+    { protocol: 'socks5', url: 'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt' },
+    { protocol: 'http', url: 'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt' },
+    { protocol: 'socks4', url: 'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks4/data.txt' },
+    { protocol: 'socks5', url: 'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt' },
+    { protocol: 'http', url: 'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt' },
+    { protocol: 'socks4', url: 'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt' },
+    { protocol: 'socks5', url: 'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt' },
+];
 
 export type SiteCategory =
   | 'CMS'
@@ -41,9 +66,11 @@ export interface CmsDetectionResult {
     url: string;
     cms: string | null;
     version: string | null;
+    versionSource: string | null;
     category: SiteCategory;
     confidence: number;
     detectionMethod: string[];
+    evidence: DetectionEvidence[];
     detectedAt: Date;
     rawSignals: Record<string, string>;
     serverTech: string[];
@@ -52,32 +79,72 @@ export interface CmsDetectionResult {
     pageTitle: string | null;
 }
 
+export interface CmsDetectOptions {
+    mode?: 'FAST' | 'FULL';
+    timeoutMs?: number;
+}
+
 interface TechSignal {
     name: string;
     version: string | null;
     category: SiteCategory;
     confidence: number;
     method: string;
+    source?: string;
+}
+
+export type EvidenceType =
+  | 'file'
+  | 'meta'
+  | 'cookie'
+  | 'inline'
+  | 'header'
+  | 'asset'
+  | 'crawl'
+  | 'comment'
+  | 'bundle'
+  | 'pattern'
+  | 'other';
+
+export interface DetectionEvidence {
+    name: string;
+    method: string;
+    type: EvidenceType;
+    confidence: number;
+    version: string | null;
+    source: string | null;
 }
 
 @Injectable()
 export class CmsDetectorService implements OnModuleInit {
     private readonly logger = new Logger(CmsDetectorService.name);
 
-    private proxies: string[] = (process.env['PROXY_LIST'] || '')
-        .split(',').map(p => p.trim()).filter(Boolean);
+    private proxies: string[] = this.getManualProxies();
     private proxyIndex = 0;
 
     // Auto-refresh state
     private readonly refreshMinutes = Math.max(5, Number(process.env['PROXY_REFRESH_MINUTES'] || 360));
     private readonly maxProxies     = Math.max(10, Number(process.env['PROXY_MAX'] || 200));
-    private readonly sources        = (process.env['PROXY_SOURCES'] || '')
+    private readonly configuredSources = (process.env['PROXY_SOURCES'] || '')
         .split(',').map(s => s.trim()).filter(Boolean)
         .map(spec => {
             const [proto, url] = spec.split('|');
             return { protocol: (proto || 'http').toLowerCase(), url: (url || '').trim() };
         })
         .filter(s => s.url);
+    private readonly usingDefaultProxySources = this.configuredSources.length === 0;
+    private readonly sources = this.usingDefaultProxySources ? DEFAULT_PROXY_SOURCES : this.configuredSources;
+    private readonly validationCandidateLimit = Math.max(
+        this.maxProxies,
+        Number(process.env['PROXY_VALIDATION_CANDIDATES'] || Math.min(this.maxProxies * 2, 180)),
+    );
+    private readonly validationTarget = Math.max(1, Math.min(
+        this.maxProxies,
+        Number(process.env['PROXY_VALIDATION_TARGET'] || 50),
+    ));
+    private readonly validationConcurrency = Math.max(5, Number(process.env['PROXY_VALIDATION_CONCURRENCY'] || 80));
+    private readonly validationTimeoutMs = Math.max(1000, Number(process.env['PROXY_VALIDATION_TIMEOUT_MS'] || 2000));
+    private readonly proxyFetchTimeoutMs = Math.max(1000, Number(process.env['PROXY_FETCH_TIMEOUT_MS'] || 3500));
     private lastRefresh: string | null = null;
     private refreshing = false;
     private sourceStatus: ProxySourceStatus[] = [];
@@ -108,9 +175,7 @@ export class CmsDetectorService implements OnModuleInit {
             this.proxyIndex++;
             const h = this.proxyHealth.get(proxy);
             if (h && h.deadUntil > now) continue;  // skip dead proxy
-            const agent = (proxy.startsWith('socks4://') || proxy.startsWith('socks5://'))
-                ? new SocksProxyAgent(proxy)
-                : new HttpsProxyAgent(proxy);
+            const agent = this.createProxyAgent(proxy);
             return { agent, proxyUrl: proxy };
         }
         // All dead — fall back to direct (own IP) rather than fail
@@ -157,7 +222,8 @@ export class CmsDetectorService implements OnModuleInit {
 
     private startAutoRefresh() {
         if (this.refreshTimer) return;
-        this.logger.log(`Proxy auto-refresh: ${this.sources.length} source(s), every ${this.refreshMinutes} min`);
+        const sourceMode = this.usingDefaultProxySources ? 'default' : 'env';
+        this.logger.log(`Proxy auto-refresh: ${this.sources.length} ${sourceMode} source(s), every ${this.refreshMinutes} min`);
         this.refreshProxies().catch(e => this.logger.error(`Initial proxy refresh failed: ${e?.message}`));
         this.refreshTimer = setInterval(
             () => this.refreshProxies().catch(e => this.logger.error(`Proxy refresh failed: ${e?.message}`)),
@@ -176,19 +242,15 @@ export class CmsDetectorService implements OnModuleInit {
         if (enabled === this.autoRefreshEnabled) return { enabled };
         this.autoRefreshEnabled = enabled;
         if (enabled) {
-            if (!this.sources.length) {
-                this.logger.warn('Avto-yangilash yoqildi, lekin PROXY_SOURCES bo\'sh');
-            } else {
-                this.startAutoRefresh();
-            }
+            this.startAutoRefresh();
         } else {
             this.stopAutoRefresh();
             // Wipe so getNextAgent() returns undefined → axios uses default agent → own IP
-            this.proxies = [];
+            this.proxies = this.getManualProxies();
             this.proxyIndex = 0;
             this.sourceStatus = [];
             this.lastRefresh = null;
-            this.logger.log('Avto-yangilash o\'chirildi — skaner o\'z IP orqali ishlaydi');
+            this.logger.log('Avto-yangilash o\'chirildi — faqat PROXY_LIST yoki o\'z IP orqali ishlaydi');
         }
         return { enabled };
     }
@@ -197,9 +259,10 @@ export class CmsDetectorService implements OnModuleInit {
         if (this.refreshing) return { total: this.proxies.length, sources: this.sourceStatus };
         this.refreshing = true;
         try {
-            const collected = new Set<string>();
+            const manual = this.getManualProxies();
+            const collected = new Set<string>(manual);
             const statuses: ProxySourceStatus[] = [];
-            const perSourceQuota = Math.max(20, Math.ceil(this.maxProxies / Math.max(this.sources.length, 1)));
+            const perSourceQuota = Math.max(30, Math.ceil(this.validationCandidateLimit / Math.max(this.sources.length, 1)));
             let capReached = false;
             for (const src of this.sources) {
                 const status: ProxySourceStatus = {
@@ -229,7 +292,7 @@ export class CmsDetectorService implements OnModuleInit {
                             collected.add(normalized);
                             added++;
                             if (added >= perSourceQuota) break;
-                            if (collected.size >= this.maxProxies) break;
+                            if (collected.size >= this.validationCandidateLimit) break;
                         }
                     }
                     status.ok = true;
@@ -239,17 +302,19 @@ export class CmsDetectorService implements OnModuleInit {
                     status.error = e?.message || 'fetch failed';
                 }
                 statuses.push(status);
-                if (collected.size >= this.maxProxies) capReached = true;
+                if (collected.size >= this.validationCandidateLimit) capReached = true;
             }
             const list = Array.from(collected);
-            const validated = list.length ? await this.validateProxies(list) : [];
+            const validated = list.length ? await this.validateProxies(list, this.validationTarget) : [];
             if (validated.length) {
                 this.proxies = validated;
                 this.proxyIndex = 0;
                 this.proxyHealth.clear();   // fresh start for new list
                 this.logger.log(`Proxy validation: ${validated.length}/${list.length} alive`);
             } else if (list.length) {
-                this.logger.warn(`Proxy validation: 0/${list.length} alive — keeping previous list`);
+                this.proxies = manual;
+                this.proxyIndex = 0;
+                this.logger.warn(`Proxy validation: 0/${list.length} alive — ${manual.length ? 'using PROXY_LIST' : 'using own IP'}`);
             } else {
                 this.logger.warn('Proxy refresh returned 0 proxies — keeping previous list');
             }
@@ -262,45 +327,93 @@ export class CmsDetectorService implements OnModuleInit {
         }
     }
 
-    private async pingProxy(proxy: string, timeoutMs = 4000): Promise<boolean> {
+    private getManualProxies(): string[] {
+        const rawList = (process.env['PROXY_LIST'] || '')
+            .split(',')
+            .map(p => p.trim())
+            .filter(Boolean);
+
+        const normalized = rawList
+            .map(proxy => this.normalizeProxyLine(proxy, 'http'))
+            .filter((proxy): proxy is string => !!proxy);
+
+        return Array.from(new Set(normalized));
+    }
+
+    private createProxyAgent(proxy: string) {
+        return (proxy.startsWith('socks4://') || proxy.startsWith('socks5://'))
+            ? new SocksProxyAgent(proxy)
+            : new HttpsProxyAgent(proxy);
+    }
+
+    private isProxySuspectResponse(status: number, body: unknown): boolean {
+        if ([403, 407, 429, 502, 503, 504].includes(status)) return true;
+        const text = typeof body === 'string' ? body.slice(0, 2000) : '';
+        return /proxy authentication|required proxy|proxy error|tunnel connection failed|connection refused|access denied|request blocked/i.test(text);
+    }
+
+    private async pingProxy(proxy: string, timeoutMs = this.validationTimeoutMs): Promise<boolean> {
+        const targets = [
+            'https://api.ipify.org/?format=json',
+            'http://api.ipify.org/?format=json',
+        ];
+
         try {
-            const agent = (proxy.startsWith('socks4://') || proxy.startsWith('socks5://'))
-                ? new SocksProxyAgent(proxy)
-                : new HttpsProxyAgent(proxy);
-            const r = await axios.get<any>('https://api.ipify.org/?format=json', {
-                timeout: timeoutMs,
-                httpAgent: agent,
-                httpsAgent: agent,
-                proxy: false,
-                validateStatus: s => s >= 200 && s < 300,
+            const checks = targets.map(async target => {
+                const agent = this.createProxyAgent(proxy);
+                const r = await axios.get<any>(target, {
+                    timeout: timeoutMs,
+                    signal: AbortSignal.timeout(timeoutMs),
+                    httpAgent: agent,
+                    httpsAgent: agent,
+                    proxy: false,
+                    validateStatus: s => s >= 200 && s < 300,
+                });
+                return !!r.data?.ip;
             });
-            return !!r.data?.ip;
+            const results = await Promise.allSettled(checks);
+            return results.some(result => result.status === 'fulfilled' && result.value);
         } catch {
             return false;
         }
     }
 
-    private async validateProxies(list: string[]): Promise<string[]> {
-        const CONCURRENCY = 50;
+    private async validateProxies(list: string[], limit = this.maxProxies): Promise<string[]> {
         const alive: string[] = [];
-        for (let i = 0; i < list.length; i += CONCURRENCY) {
-            const batch = list.slice(i, i + CONCURRENCY);
+        for (let i = 0; i < list.length && alive.length < limit; i += this.validationConcurrency) {
+            const batch = list.slice(i, i + this.validationConcurrency);
             const results = await Promise.all(batch.map(async p => ({ p, ok: await this.pingProxy(p) })));
             for (const { p, ok } of results) if (ok) alive.push(p);
+            if (alive.length >= limit) break;
         }
-        return alive;
+        return alive.slice(0, limit);
     }
 
     private normalizeProxyLine(raw: string, defaultProto: string): string | null {
-        // Already has protocol prefix
-        if (/^(socks5|socks4|https?):\/\//i.test(raw)) {
-            const m = raw.match(/^(socks5|socks4|https?):\/\/(?:[^@]+@)?([^:\/\s]+):(\d{2,5})\b/i);
-            return m ? raw.split(/\s+/)[0] : null;
+        const token = raw.split(/[,\s;]/)[0]?.trim();
+        if (!token || token.startsWith('#')) return null;
+
+        const allowed = new Set(['http', 'https', 'socks4', 'socks5']);
+        const withProto = /^(socks5|socks4|https?):\/\//i.test(token)
+            ? token
+            : `${defaultProto}://${token}`;
+
+        try {
+            const parsed = new URL(withProto);
+            const protocol = parsed.protocol.replace(':', '').toLowerCase();
+            if (!allowed.has(protocol)) return null;
+            if (!parsed.hostname || !parsed.port) return null;
+            const port = Number(parsed.port);
+            if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+            if (/^(0\.0\.0\.0|127\.|localhost$)/i.test(parsed.hostname)) return null;
+
+            const auth = parsed.username
+                ? `${decodeURIComponent(parsed.username)}${parsed.password ? `:${decodeURIComponent(parsed.password)}` : ''}@`
+                : '';
+            return `${protocol}://${auth}${parsed.hostname}:${port}`;
+        } catch {
+            return null;
         }
-        // Bare ip:port
-        const m = raw.match(/^([0-9a-zA-Z][\w.-]*):(\d{2,5})$/);
-        if (m) return `${defaultProto}://${m[1]}:${m[2]}`;
-        return null;
     }
 
     async testProxy(input?: { proxy?: string; index?: number }): Promise<{
@@ -344,9 +457,7 @@ export class CmsDetectorService implements OnModuleInit {
         }
 
         const meta = parseProxy(raw);
-        const agent = raw.startsWith('socks4://') || raw.startsWith('socks5://')
-            ? new SocksProxyAgent(raw)
-            : new HttpsProxyAgent(raw);
+        const agent = this.createProxyAgent(raw);
         try {
             const r = await axios.get<any>(TARGET, {
                 timeout: 8000,
@@ -413,12 +524,17 @@ export class CmsDetectorService implements OnModuleInit {
                 deadAfterFails:   this.PROXY_DEAD_AFTER,
                 reviveMinutes:    Math.round(this.PROXY_REVIVE_MS / 60_000),
                 domainCooldownSec: Math.round(this.DOMAIN_COOLDOWN_MS / 1000),
+                proxyFetchTimeoutMs: this.proxyFetchTimeoutMs,
             },
             autoRefresh: {
                 enabled:         this.autoRefreshEnabled,
                 available:       this.sources.length > 0,
+                sourceMode:      this.usingDefaultProxySources ? 'default' : 'env',
                 intervalMinutes: this.refreshMinutes,
                 maxProxies:      this.maxProxies,
+                candidateLimit:  this.validationCandidateLimit,
+                validationTarget: this.validationTarget,
+                manualCount:     this.getManualProxies().length,
                 lastRefresh:     this.lastRefresh,
                 refreshing:      this.refreshing,
                 sources:         this.sourceStatus.length
@@ -963,6 +1079,157 @@ export class CmsDetectorService implements OnModuleInit {
             name: 'AmoCRM',
             patterns: [/amocrm/i, /amoCRM/i],
         },
+        {
+            name: 'Craft CMS',
+            patterns: [
+                /craftcms/i, /Craft\.CMS/i, /CRAFT_CSRF_TOKEN/i,
+                /\/cpresources\//i, /\/index\.php\?p=/i, /craft\.js/i,
+            ],
+            versionPatterns: [/Craft CMS\s*([\d.]+)/i],
+            cookieKeys: [/CraftSessionId/i, /CRAFT_CSRF_TOKEN/i],
+            headerKeys: [{ key: 'x-powered-by', pattern: /Craft CMS/i, versionPattern: /Craft CMS\s*([\d.]+)/i }],
+        },
+        {
+            name: 'Concrete CMS',
+            patterns: [
+                /concrete5/i, /Concrete CMS/i, /\/concrete\/js\//i,
+                /\/concrete\/css\//i, /ccm_/i, /data-area-handle/i,
+            ],
+            versionPatterns: [/concrete5\s*-\s*([\d.]+)/i, /Concrete CMS\s*([\d.]+)/i],
+            cookieKeys: [/CONCRETE5/i, /ccmUserHash/i],
+        },
+        {
+            name: 'SilverStripe',
+            patterns: [/silverstripe/i, /\/framework\/thirdparty\//i, /\/mysite\/javascript\//i, /SecurityID/i],
+            cookieKeys: [/PastMember/i, /SilverStripe/i],
+        },
+        {
+            name: 'Umbraco',
+            patterns: [
+                /umbraco/i, /\/umbraco\//i, /\/umbraco_client\//i,
+                /DependencyHandler\.axd/i, /umbraco\.surface/i,
+            ],
+            versionPatterns: [/Umbraco\s*([\d.]+)/i],
+            cookieKeys: [/UMB_UCONTEXT/i, /UMB-XSRF/i, /UMB_PREVIEW/i],
+            headerKeys: [{ key: 'x-umbraco-version', pattern: /.+/, versionPattern: /([\d.]+)/ }],
+        },
+        {
+            name: 'Kentico Xperience',
+            patterns: [
+                /kentico/i, /xperience/i, /\/CMSPages\//i, /\/CMSScripts\//i,
+                /\/CMSPages\/GetResource\.ashx/i, /\/getmedia\//i,
+            ],
+            versionPatterns: [/Kentico\s*([\d.]+)/i, /Xperience\s*([\d.]+)/i],
+            cookieKeys: [/CMSPreferredCulture/i, /CMSCsrfCookie/i, /CMSCurrentTheme/i, /CMSCookieLevel/i],
+            headerKeys: [{ key: 'x-powered-by', pattern: /Kentico|Xperience/i }],
+        },
+        {
+            name: 'Sitecore',
+            patterns: [
+                /sitecore/i, /\/sitecore\//i, /\/-\/media\//i,
+                /\/layouts\/system\//i, /sc_mode=/i, /Sitecore Experience/i,
+            ],
+            versionPatterns: [/Sitecore\s*([\d.]+)/i],
+            cookieKeys: [/SC_ANALYTICS_GLOBAL_COOKIE/i, /sitecore/i],
+            headerKeys: [{ key: 'x-powered-by', pattern: /Sitecore/i }],
+        },
+        {
+            name: 'Adobe Experience Manager',
+            patterns: [
+                /Adobe Experience Manager/i, /\bAEM\b/i, /\/etc\.clientlibs\//i,
+                /\/content\/dam\//i, /\/libs\/granite\//i, /cq:template/i,
+            ],
+            versionPatterns: [/Adobe Experience Manager\s*([\d.]+)/i],
+            cookieKeys: [/login-token/i, /cq-authoring-mode/i],
+            headerKeys: [{ key: 'x-dispatcher', pattern: /.+/ }],
+        },
+        {
+            name: 'Liferay',
+            patterns: [
+                /liferay/i, /Liferay\.ThemeDisplay/i, /\/o\/frontend-/i,
+                /\/o\/classic-theme\//i, /\/documents\//i,
+            ],
+            versionPatterns: [/Liferay\s*([\d.]+)/i],
+            cookieKeys: [/GUEST_LANGUAGE_ID/i, /LFR_SESSION_STATE/i, /COMPANY_ID/i],
+            headerKeys: [{ key: 'liferay-portal', pattern: /.+/, versionPattern: /Liferay Portal\s*([\d.]+)/i }],
+        },
+        {
+            name: 'DNN',
+            patterns: [
+                /DotNetNuke/i, /\bDNN\b/i, /\/DesktopModules\//i,
+                /\/Portals\/_default\//i, /dnn_/i,
+            ],
+            versionPatterns: [/DotNetNuke\s*([\d.]+)/i, /DNN\s*([\d.]+)/i],
+            cookieKeys: [/\.DOTNETNUKE/i, /dnn_IsMobile/i],
+        },
+        {
+            name: 'Orchard Core',
+            patterns: [/OrchardCore/i, /Orchard\.Core/i, /\/OrchardCore\./i, /powered by Orchard/i],
+            versionPatterns: [/Orchard Core\s*([\d.]+)/i],
+        },
+        {
+            name: 'SharePoint',
+            patterns: [
+                /Microsoft SharePoint/i, /\/_layouts\/15\//i, /\/_catalogs\//i,
+                /\/_vti_bin\//i, /SharePointPageContextInfo/i,
+            ],
+            versionPatterns: [/SharePoint\s*([\d.]+)/i],
+            cookieKeys: [/FedAuth/i, /rtFa/i],
+            headerKeys: [
+                { key: 'microsoftsharepointteamservices', pattern: /.+/, versionPattern: /([\d.]+)/ },
+                { key: 'x-sharepointhealthscore', pattern: /.+/ },
+            ],
+        },
+        {
+            name: 'Plone',
+            patterns: [/plone/i, /portal_css/i, /portal_javascripts/i, /data-portal-url/i],
+            versionPatterns: [/Plone\s*([\d.]+)/i],
+            cookieKeys: [/__ac/i, /I18N_LANGUAGE/i],
+        },
+        {
+            name: 'HubSpot CMS',
+            patterns: [
+                /hubspot/i, /hs-scripts\.com/i, /hsforms\.net/i,
+                /js\.hsforms\.net/i, /_hsq/i, /hubspotutk/i,
+            ],
+            cookieKeys: [/hubspotutk/i, /__hstc/i, /__hssc/i],
+        },
+        {
+            name: 'Blogger',
+            patterns: [/blogger\.com/i, /blogspot\.com/i, /\/feeds\/posts\/default/i, /Blogger Template/i],
+            versionPatterns: [/Blogger\s*([\d.]+)/i],
+        },
+        {
+            name: 'Weebly',
+            patterns: [/weebly\.com/i, /cdn2\.editmysite\.com/i, /Weebly\.com/i, /wsite-/i],
+        },
+        {
+            name: 'Duda',
+            patterns: [/duda\.co/i, /static-cdn\.multiscreensite\.com/i, /dmRespCol/i, /dmBody/i],
+        },
+        {
+            name: 'Framer',
+            patterns: [/framerusercontent\.com/i, /framer-motion/i, /data-framer-/i, /__framer/i],
+        },
+        {
+            name: 'Google Sites',
+            patterns: [/sites\.google\.com/i, /googlesites/i, /google-site-verification/i, /jotspot/i],
+        },
+        {
+            name: 'Textpattern',
+            patterns: [/textpattern/i, /txp-/i, /\/textpattern\/css\.php/i],
+            cookieKeys: [/txp_login/i],
+        },
+        {
+            name: 'ExpressionEngine',
+            patterns: [/ExpressionEngine/i, /exp:channel/i, /\/themes\/ee\//i, /EE\.publish/i],
+            cookieKeys: [/exp_tracker/i, /exp_last_visit/i],
+        },
+        {
+            name: 'Statamic',
+            patterns: [/statamic/i, /\/vendor\/statamic\//i, /Statamic\.csrfToken/i],
+            cookieKeys: [/statamic/i],
+        },
     ];
 
     // ── CMS → DETAILED CATEGORY MAP ──────────────────────────────────────────
@@ -970,7 +1237,12 @@ export class CmsDetectorService implements OnModuleInit {
         // Traditional CMS
         WordPress: 'CMS', Joomla: 'CMS', Drupal: 'CMS', Bitrix: 'CMS',
         MODX: 'CMS', OctoberCMS: 'CMS', TYPO3: 'CMS', DLE: 'CMS',
-        'UMI.CMS': 'CMS', UzGovCMS: 'CMS',
+        'UMI.CMS': 'CMS', UzGovCMS: 'CMS', 'Craft CMS': 'CMS',
+        'Concrete CMS': 'CMS', SilverStripe: 'CMS', Umbraco: 'CMS',
+        'Kentico Xperience': 'CMS', Sitecore: 'CMS',
+        'Adobe Experience Manager': 'CMS', Liferay: 'CMS', DNN: 'CMS',
+        'Orchard Core': 'CMS', SharePoint: 'CMS', Plone: 'CMS',
+        Textpattern: 'CMS', ExpressionEngine: 'CMS', Statamic: 'CMS',
         // E-commerce
         Shopify: 'E-commerce CMS', WooCommerce: 'E-commerce CMS',
         Magento: 'E-commerce CMS', PrestaShop: 'E-commerce CMS',
@@ -978,6 +1250,8 @@ export class CmsDetectorService implements OnModuleInit {
         // Web Builders
         Wix: 'Web Builder / No-Code Platform', Squarespace: 'Web Builder / No-Code Platform',
         Webflow: 'Web Builder / No-Code Platform', Tilda: 'Web Builder / No-Code Platform',
+        Weebly: 'Web Builder / No-Code Platform', Duda: 'Web Builder / No-Code Platform',
+        Framer: 'Web Builder / No-Code Platform', 'Google Sites': 'Web Builder / No-Code Platform',
         // Fullstack Frameworks
         'Next.js': 'Fullstack Framework', 'Nuxt.js': 'Fullstack Framework',
         SvelteKit: 'Fullstack Framework', Remix: 'Fullstack Framework', Astro: 'Fullstack Framework',
@@ -994,14 +1268,15 @@ export class CmsDetectorService implements OnModuleInit {
         // Headless CMS
         Contentful: 'Headless CMS', Sanity: 'Headless CMS', Strapi: 'Headless CMS',
         Directus: 'Headless CMS', Prismic: 'Headless CMS', DatoCMS: 'Headless CMS',
-        Storyblok: 'Headless CMS',
+        Storyblok: 'Headless CMS', Hygraph: 'Headless CMS', ButterCMS: 'Headless CMS',
+        'Netlify CMS': 'Headless CMS', 'Payload CMS': 'Headless CMS',
         // Static Site Generators
         Gatsby: 'Static Site Generator (SSG)', Hugo: 'Static Site Generator (SSG)',
         Jekyll: 'Static Site Generator (SSG)', Eleventy: 'Static Site Generator (SSG)',
         VitePress: 'Static Site Generator (SSG)', Docusaurus: 'Static Site Generator (SSG)',
         Hexo: 'Static Site Generator (SSG)',
         // Blog Engines
-        Ghost: 'Blog Engine',
+        Ghost: 'Blog Engine', Blogger: 'Blog Engine',
         // Forum Engines
         phpBB: 'Forum Engine', vBulletin: 'Forum Engine', XenForo: 'Forum Engine',
         MyBB: 'Forum Engine', Discourse: 'Forum Engine',
@@ -1011,6 +1286,7 @@ export class CmsDetectorService implements OnModuleInit {
         Moodle: 'Learning Management System (LMS)', 'Canvas LMS': 'Learning Management System (LMS)',
         // CRM / ERP
         Bitrix24: 'CRM / ERP Web System', AmoCRM: 'CRM / ERP Web System',
+        'HubSpot CMS': 'CRM / ERP Web System',
     };
 
     // ── FRAMEWORK PATTERNS ────────────────────────────────────────────────────
@@ -1093,6 +1369,10 @@ export class CmsDetectorService implements OnModuleInit {
         { name: 'Prismic', patterns: [/prismic\.io/i] },
         { name: 'DatoCMS', patterns: [/datocms\.com/i] },
         { name: 'Storyblok', patterns: [/storyblok\.com/i] },
+        { name: 'Hygraph', patterns: [/hygraph\.com/i, /graphcms/i] },
+        { name: 'ButterCMS', patterns: [/buttercms\.com/i] },
+        { name: 'Netlify CMS', patterns: [/netlify-cms/i, /decap-cms/i] },
+        { name: 'Payload CMS', patterns: [/payloadcms/i, /payload\.config/i] },
     ];
 
     // ── STATIC SITE ───────────────────────────────────────────────────────────
@@ -1125,14 +1405,21 @@ export class CmsDetectorService implements OnModuleInit {
         { name: 'jQuery', patterns: [/jquery/i, /jQuery/i] },
         { name: 'HTMX', patterns: [/htmx\.org/i, /hx-get=/i] },
         { name: 'Ember', patterns: [/ember\.js/i] },
+        { name: 'Qwik', patterns: [/q:container/i, /\/build\/q-/i, /qwik/i] },
+        { name: 'Solid', patterns: [/solid-js/i, /data-hk=/i] },
+        { name: 'Lit', patterns: [/lit-element/i, /lit-html/i] },
+        { name: 'Stimulus', patterns: [/data-controller=/i, /stimulus/i] },
     ];
 
     // ── MAIN ─────────────────────────────────────────────────────────────────
-    async detect(url: string): Promise<CmsDetectionResult> {
+    async detect(url: string, options: CmsDetectOptions = {}): Promise<CmsDetectionResult> {
         const baseUrl = this.normalizeUrl(url);
+        const mode = options.mode === 'FAST' ? 'FAST' : 'FULL';
+        const timeoutMs = this.normalizeTimeout(options.timeoutMs, mode);
+        const cacheKey = `${baseUrl}:${mode}:${timeoutMs}`;
 
         // Cache hit → return early (refresh detectedAt)
-        const cached = this.detectCache.get(baseUrl);
+        const cached = this.detectCache.get(cacheKey);
         if (cached && Date.now() < cached.exp) {
             return { ...cached.result, detectedAt: new Date() };
         }
@@ -1144,59 +1431,60 @@ export class CmsDetectorService implements OnModuleInit {
         let httpStatus: number | null = null;
         let pageTitle: string | null = null;
         let mainPage_result: { html: string; headers: Record<string, string>; status: number } | null = null;
+        rawSignals['_scan_mode'] = mode;
 
         try {
-            const [mainPage, robotsPage, sitemapPage] = await Promise.allSettled([
-                this.fetchPage(baseUrl),
-                this.fetchPage(baseUrl + '/robots.txt'),
-                this.fetchPage(baseUrl + '/sitemap.xml'),
-            ]);
+            if (mode === 'FAST') {
+                const main = await this.fetchPage(baseUrl, 0, timeoutMs);
+                mainPage_result = main;
 
-            const main = mainPage.status === 'fulfilled' ? mainPage.value : null;
-            mainPage_result = main;
-            const robots = robotsPage.status === 'fulfilled' ? robotsPage.value : null;
-            const sitemap = sitemapPage.status === 'fulfilled' ? sitemapPage.value : null;
-
-            if (main) {
-                httpStatus = main.status;
-                serverTech = this.detectServerTech(main.headers, rawSignals);
-                jsFrameworks = this.detectJsFrameworks(main.html);
-
-                // Extract best display name: og:site_name > application-name > cleaned title
-                const $ = cheerio.load(main.html);
-                const rawTitle    = $('title').first().text().trim();
-                const ogSiteName  = $('meta[property="og:site_name"]').attr('content')?.trim();
-                const appName     = $('meta[name="application-name"]').attr('content')?.trim();
-                const dcTitle     = $('meta[name="DC.title"]').attr('content')?.trim();
-                pageTitle = ogSiteName || appName || dcTitle || this.extractSiteName(rawTitle) || null;
-
-                signals.push(...this.checkPatternGroup(main.html, main.headers, this.CMS_PATTERNS, 'CMS', rawSignals));
-                signals.push(...this.checkPatternGroup(main.html, main.headers, this.FRAMEWORK_PATTERNS, 'Backend Framework', rawSignals));
-                signals.push(...this.checkPatternGroup(main.html, main.headers, this.HEADLESS_PATTERNS, 'Headless CMS', rawSignals));
-                signals.push(...this.checkPatternGroup(main.html, main.headers, this.STATIC_PATTERNS, 'Static Site Generator (SSG)', rawSignals));
-                signals.push(...this.checkMetaGenerator(main.html, rawSignals));
-                signals.push(...this.checkJsCssVersions(main.html, rawSignals));
-                signals.push(...this.checkHtmlComments(main.html, rawSignals));
-                signals.push(...this.checkCookies(main.headers, rawSignals));
-                signals.push(...this.checkInlineVersionPatterns(main.html, rawSignals));
-            }
-
-            if (robots?.html) signals.push(...this.checkRobotsTxt(robots.html, rawSignals));
-            if (sitemap?.html) signals.push(...this.checkSitemap(sitemap.html, rawSignals));
-
-            // Smart file probes: skip if meta generator already gave high-conf answer,
-            // else only probe top-3 CMS candidates from prior signals (full sweep if no candidates).
-            const metaWin = signals.some(s => s.method === 'meta generator' && s.confidence >= 90);
-            if (!metaWin) {
-                const tally: Record<string, number> = {};
-                for (const s of signals) {
-                    if (s.category === 'CMS') tally[s.name] = Math.max(tally[s.name] ?? 0, s.confidence);
+                if (main) {
+                    httpStatus = main.status;
+                    const pageSignals = this.collectHtmlSignals(baseUrl, main.html, main.headers, rawSignals);
+                    serverTech = pageSignals.serverTech;
+                    jsFrameworks = pageSignals.jsFrameworks;
+                    pageTitle = pageSignals.pageTitle;
+                    signals.push(...pageSignals.signals);
                 }
-                const candidates = Object.entries(tally)
-                    .sort((a, b) => b[1] - a[1])
-                    .slice(0, 3)
-                    .map(([name]) => name);
-                signals.push(...await this.checkCmsFileProbes(baseUrl, rawSignals, candidates));
+            } else {
+                const [mainPage, robotsPage, sitemapPage] = await Promise.allSettled([
+                    this.fetchPage(baseUrl, 0, timeoutMs),
+                    this.fetchPage(baseUrl + '/robots.txt', 0, timeoutMs),
+                    this.fetchPage(baseUrl + '/sitemap.xml', 0, timeoutMs),
+                ]);
+
+                const main = mainPage.status === 'fulfilled' ? mainPage.value : null;
+                mainPage_result = main;
+                const robots = robotsPage.status === 'fulfilled' ? robotsPage.value : null;
+                const sitemap = sitemapPage.status === 'fulfilled' ? sitemapPage.value : null;
+
+                if (main) {
+                    httpStatus = main.status;
+                    const pageSignals = this.collectHtmlSignals(baseUrl, main.html, main.headers, rawSignals);
+                    serverTech = pageSignals.serverTech;
+                    jsFrameworks = pageSignals.jsFrameworks;
+                    pageTitle = pageSignals.pageTitle;
+                    signals.push(...pageSignals.signals);
+                    signals.push(...await this.checkLinkedAssetFingerprints(baseUrl, main.html, rawSignals, timeoutMs));
+                }
+
+                if (robots?.html) signals.push(...this.checkRobotsTxt(robots.html, rawSignals));
+                if (sitemap?.html) signals.push(...this.checkSitemap(sitemap.html, rawSignals));
+
+                // Smart file probes: skip if meta generator already gave high-conf answer,
+                // else only probe top-3 CMS candidates from prior signals (full sweep if no candidates).
+                const metaWin = signals.some(s => s.method === 'meta generator' && s.confidence >= 90);
+                if (!metaWin) {
+                    const tally: Record<string, number> = {};
+                    for (const s of signals) {
+                        if (s.category === 'CMS') tally[s.name] = Math.max(tally[s.name] ?? 0, s.confidence);
+                    }
+                    const candidates = Object.entries(tally)
+                        .sort((a, b) => b[1] - a[1])
+                        .slice(0, 3)
+                        .map(([name]) => name);
+                    signals.push(...await this.checkCmsFileProbes(baseUrl, rawSignals, candidates, timeoutMs));
+                }
             }
 
         } catch (err) {
@@ -1214,18 +1502,346 @@ export class CmsDetectorService implements OnModuleInit {
                 || /<div[^>]+id=["'](?:root|app)["'][^>]*>(?:\s|<!--[\s\S]*?-->)*<\/div>/i.test(html);
             if (hasShell || jsFrameworks.length > 0) {
                 const cmsName = jsFrameworks[0] ?? 'SPA (Custom)';
+                const method = hasShell ? 'SPA shell' : `JS framework: ${cmsName}`;
                 result.cms = cmsName;
                 result.confidence = jsFrameworks.length ? 55 : 45;
                 result.category = 'Frontend Framework / SPA';
-                result.detectionMethod = [...result.detectionMethod, hasShell ? 'SPA shell' : `JS framework: ${cmsName}`];
+                result.detectionMethod = [...result.detectionMethod, method];
+                result.evidence = [
+                    ...result.evidence,
+                    { name: cmsName, method, type: 'other', confidence: result.confidence, version: null, source: null },
+                ];
+                result.rawSignals['_evidence'] = JSON.stringify(result.evidence);
             }
         }
 
         // Cache only successful (non-empty) detections
         if (result.cms || serverTech.length || jsFrameworks.length) {
-            this.detectCache.set(baseUrl, { result, exp: Date.now() + this.DETECT_TTL });
+            this.detectCache.set(cacheKey, { result, exp: Date.now() + this.DETECT_TTL });
         }
         return result;
+    }
+
+    detectFromHtml(
+        url: string,
+        html: string,
+        headers: Record<string, string> = {},
+        status = 200,
+    ): CmsDetectionResult {
+        const baseUrl = this.normalizeUrl(url);
+        const rawSignals: Record<string, string> = {};
+        const normalizedHeaders = this.normalizeHeaders(headers);
+        const pageSignals = this.collectHtmlSignals(baseUrl, html, normalizedHeaders, rawSignals);
+        return this.resolveResult(
+            baseUrl,
+            pageSignals.signals,
+            rawSignals,
+            pageSignals.serverTech,
+            pageSignals.jsFrameworks,
+            status,
+            pageSignals.pageTitle,
+            html,
+            normalizedHeaders,
+        );
+    }
+
+    private collectHtmlSignals(
+        baseUrl: string,
+        html: string,
+        headers: Record<string, string>,
+        rawSignals: Record<string, string>,
+    ): {
+        signals: TechSignal[];
+        serverTech: string[];
+        jsFrameworks: string[];
+        pageTitle: string | null;
+    } {
+        const signals: TechSignal[] = [];
+        const serverTech = this.detectServerTech(headers, rawSignals);
+        const jsFrameworks = this.detectJsFrameworks(html);
+
+        const $ = cheerio.load(html);
+        const rawTitle    = $('title').first().text().trim();
+        const ogSiteName  = $('meta[property="og:site_name"]').attr('content')?.trim();
+        const appName     = $('meta[name="application-name"]').attr('content')?.trim();
+        const dcTitle     = $('meta[name="DC.title"]').attr('content')?.trim();
+        const pageTitle = ogSiteName || appName || dcTitle || this.extractSiteName(rawTitle) || null;
+        this.collectDefacementSignals($, html, rawSignals);
+
+        signals.push(...this.checkPatternGroup(html, headers, this.CMS_PATTERNS, 'CMS', rawSignals));
+        signals.push(...this.checkPatternGroup(html, headers, this.FRAMEWORK_PATTERNS, 'Backend Framework', rawSignals));
+        signals.push(...this.checkPatternGroup(html, headers, this.HEADLESS_PATTERNS, 'Headless CMS', rawSignals));
+        signals.push(...this.checkPatternGroup(html, headers, this.STATIC_PATTERNS, 'Static Site Generator (SSG)', rawSignals));
+        signals.push(...this.checkMetaGenerator(html, rawSignals));
+        signals.push(...this.checkJsCssVersions(html, rawSignals));
+        signals.push(...this.checkHtmlComments(html, rawSignals));
+        signals.push(...this.checkCookies(headers, rawSignals));
+        signals.push(...this.checkInlineVersionPatterns(html, rawSignals));
+        signals.push(...this.checkWappalyzerStyleFingerprints(baseUrl, html, headers, rawSignals, signals));
+
+        return { signals, serverTech, jsFrameworks, pageTitle };
+    }
+
+    private collectDefacementSignals(
+        $: ReturnType<typeof cheerio.load>,
+        html: string,
+        rawSignals: Record<string, string>,
+    ) {
+        const textDom = cheerio.load(html);
+        textDom('script,style,noscript,template,svg,canvas').remove();
+
+        const title = $('title').first().text().trim();
+        const text = this.normalizeDefacementText(textDom('body').text() || textDom.root().text());
+        const fallbackContent = this.normalizeDefacementText(
+            html
+                .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+                .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+                .replace(/<[^>]+>/g, ' '),
+        );
+        const content = (text || fallbackContent).slice(0, 250_000);
+
+        const assetRefs = [
+            ...$('img[src]').map((_, el) => this.normalizeAssetRef($(el).attr('src') || '')).get(),
+            ...$('script[src]').map((_, el) => this.normalizeAssetRef($(el).attr('src') || '')).get(),
+            ...$('link[href]').map((_, el) => this.normalizeAssetRef($(el).attr('href') || '')).get(),
+        ].filter(Boolean).slice(0, 120);
+        const headings = $('h1,h2,h3')
+            .map((_, el) => this.normalizeDefacementText($(el).text()))
+            .get()
+            .filter(Boolean)
+            .slice(0, 30);
+        const structure = [
+            `assets:${assetRefs.length}`,
+            `forms:${$('form').length}`,
+            `scripts:${$('script').length}`,
+            `inputs:${$('input,textarea,select').length}`,
+            `headings:${headings.join('|')}`,
+            `refs:${assetRefs.join('|')}`,
+        ].join('\n');
+
+        const keywordText = `${title}\n${content.slice(0, 50_000)}`;
+        const keywords: Array<[string, RegExp]> = [
+            ['hacked by', /hacked\s+by/i],
+            ['defaced', /\bdefaced\b/i],
+            ['owned by', /\bowned\s+by\b/i],
+            ['pwned', /\bpwned\b/i],
+            ['cyber army', /\bcyber\s+army\b/i],
+            ['hack team', /\bhack\s+team\b/i],
+            ['security breached', /security\s+breach(?:ed)?/i],
+            ['site hacked', /site\s+(?:has\s+been\s+)?hacked/i],
+            ['index of hacked', /hacked\s+index/i],
+        ];
+        const hits = keywords
+            .filter(([, pattern]) => pattern.test(keywordText))
+            .map(([label]) => label);
+
+        rawSignals['_deface_content_hash'] = this.sha256(content);
+        rawSignals['_deface_structure_hash'] = this.sha256(structure);
+        rawSignals['_deface_title_hash'] = title ? this.sha256(this.normalizeDefacementText(title)) : '';
+        rawSignals['_deface_text_length'] = String(content.length);
+        rawSignals['_deface_asset_count'] = String(assetRefs.length);
+        rawSignals['_deface_form_count'] = String($('form').length);
+        rawSignals['_deface_script_count'] = String($('script').length);
+        rawSignals['_deface_keywords'] = hits.join(',');
+    }
+
+    private normalizeDefacementText(value: string): string {
+        return value
+            .replace(/\s+/g, ' ')
+            .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, '')
+            .replace(/\b\d{4}-\d{2}-\d{2}\b/g, '')
+            .replace(/\b\d{1,2}\.\d{1,2}\.\d{4}\b/g, '')
+            .trim()
+            .toLowerCase();
+    }
+
+    private normalizeAssetRef(value: string): string {
+        const clean = value.trim();
+        if (!clean) return '';
+        try {
+            const parsed = new URL(clean, 'https://local.invalid');
+            return parsed.pathname.replace(/\/+/g, '/').toLowerCase();
+        } catch {
+            return clean.split(/[?#]/)[0].toLowerCase();
+        }
+    }
+
+    private sha256(value: string): string {
+        return createHash('sha256').update(value || '').digest('hex');
+    }
+
+    private checkWappalyzerStyleFingerprints(
+        baseUrl: string,
+        html: string,
+        headers: Record<string, string>,
+        raw: Record<string, string>,
+        seedSignals: TechSignal[],
+    ): TechSignal[] {
+        const $ = cheerio.load(html);
+        const bodyText = $('body').text();
+        const scriptSrcs = $('script[src]').map((_, el) => $(el).attr('src') || '').get().filter(Boolean);
+        const inlineScripts = $('script:not([src])').map((_, el) => $(el).text() || '').get().filter(Boolean);
+        const meta = this.extractMetaMap($);
+        const cookies = this.extractCookiePairs(headers['set-cookie'] || '');
+        const pending: Array<{ name: string; requires?: string[]; excludes?: string[]; implies?: Array<{ name: string; confidence?: number }>; signals: TechSignal[] }> = [];
+
+        for (const fp of WAPPALYZER_STYLE_FINGERPRINTS) {
+            const localSignals: TechSignal[] = [];
+            const category = fp.category as SiteCategory;
+            const addMatches = (
+                patterns: WappalyzerStylePattern[] | undefined,
+                target: string,
+                method: string,
+                source?: string,
+            ) => {
+                if (!patterns?.length || !target) return;
+                for (const pattern of patterns) {
+                    const match = this.matchWappalyzerPattern(pattern, target);
+                    if (!match) continue;
+                    raw[`wappalyzer_${this.rawKeyPart(fp.name)}_${this.rawKeyPart(method)}_${localSignals.length + 1}`] =
+                        `${source ? `${source}: ` : ''}${match.snippet}`;
+                    localSignals.push({
+                        name: fp.name,
+                        version: match.version,
+                        category,
+                        confidence: match.confidence,
+                        method,
+                        source: source || undefined,
+                    });
+                }
+            };
+
+            addMatches(fp.html, html, 'Wappalyzer html');
+            addMatches(fp.text, bodyText, 'Wappalyzer text');
+            addMatches(fp.url, baseUrl, 'Wappalyzer url', baseUrl);
+
+            for (const src of scriptSrcs) {
+                addMatches(fp.scriptSrc, src, 'Wappalyzer scriptSrc', src);
+            }
+            for (const script of inlineScripts.slice(0, 12)) {
+                addMatches(fp.scripts, script.slice(0, 250_000), 'Wappalyzer scripts');
+            }
+
+            for (const [headerName, patterns] of Object.entries(fp.headers || {})) {
+                addMatches(patterns, headers[headerName.toLowerCase()] || '', `Wappalyzer header: ${headerName}`, headerName);
+            }
+
+            for (const [metaName, patterns] of Object.entries(fp.meta || {})) {
+                addMatches(patterns, meta[metaName.toLowerCase()] || '', `Wappalyzer meta: ${metaName}`, metaName);
+            }
+
+            for (const [cookieName, patterns] of Object.entries(fp.cookies || {})) {
+                const cookie = cookies.find(item => item.name.toLowerCase().startsWith(cookieName.toLowerCase()));
+                addMatches(patterns, cookie?.value || '', `Wappalyzer cookie: ${cookieName}`, cookie?.name);
+            }
+
+            for (const rule of fp.dom || []) {
+                try {
+                    const nodes = $(rule.selector);
+                    if (!nodes.length) continue;
+                    localSignals.push({
+                        name: fp.name,
+                        version: null,
+                        category,
+                        confidence: rule.confidence ?? 80,
+                        method: `Wappalyzer dom: ${rule.selector}`,
+                        source: rule.selector,
+                    });
+                    raw[`wappalyzer_${this.rawKeyPart(fp.name)}_dom_${localSignals.length}`] = rule.selector;
+
+                    const text = nodes.first().text();
+                    addMatches(rule.text, text, `Wappalyzer dom text: ${rule.selector}`, rule.selector);
+
+                    for (const [attr, patterns] of Object.entries(rule.attributes || {})) {
+                        const value = nodes.first().attr(attr) || '';
+                        addMatches(patterns, value, `Wappalyzer dom attr: ${rule.selector}[${attr}]`, `${rule.selector}[${attr}]`);
+                    }
+                } catch { /* invalid selector in a local fingerprint should not break detection */ }
+            }
+
+            if (localSignals.length) {
+                pending.push({
+                    name: fp.name,
+                    requires: fp.requires,
+                    excludes: fp.excludes,
+                    implies: fp.implies,
+                    signals: localSignals,
+                });
+            }
+        }
+
+        const matchedNames = new Set([
+            ...seedSignals.map(signal => signal.name),
+            ...pending.map(item => item.name),
+        ]);
+        const output: TechSignal[] = [];
+
+        for (const item of pending) {
+            if (item.requires?.some(required => !matchedNames.has(required))) continue;
+            if (item.excludes?.some(excluded => matchedNames.has(excluded))) continue;
+
+            output.push(...item.signals);
+
+            for (const implied of item.implies || []) {
+                if (matchedNames.has(implied.name)) continue;
+                matchedNames.add(implied.name);
+                output.push({
+                    name: implied.name,
+                    version: null,
+                    category: this.CMS_CATEGORY_MAP[implied.name] ?? 'Backend Framework',
+                    confidence: implied.confidence ?? 50,
+                    method: `Wappalyzer implies: ${item.name}`,
+                    source: item.name,
+                });
+            }
+        }
+
+        return output;
+    }
+
+    private matchWappalyzerPattern(
+        pattern: WappalyzerStylePattern,
+        target: string,
+    ): { confidence: number; version: string | null; snippet: string } | null {
+        pattern.regex.lastIndex = 0;
+        const match = target.match(pattern.regex);
+        if (!match) return null;
+
+        const version = pattern.version
+            ? pattern.version.replace(/\\(\d+)/g, (_, idx) => match[Number(idx)] || '').trim() || null
+            : null;
+        const index = Math.max(0, match.index ?? 0);
+        return {
+            confidence: pattern.confidence ?? 85,
+            version,
+            snippet: target.slice(index, index + 140),
+        };
+    }
+
+    private extractMetaMap($: ReturnType<typeof cheerio.load>): Record<string, string> {
+        const meta: Record<string, string> = {};
+        $('meta').each((_, el) => {
+            const key = ($(el).attr('name') || $(el).attr('property') || $(el).attr('http-equiv') || '').toLowerCase();
+            const value = $(el).attr('content') || '';
+            if (key && value) meta[key] = value;
+        });
+        return meta;
+    }
+
+    private extractCookiePairs(setCookie: string): Array<{ name: string; value: string }> {
+        const cookies: Array<{ name: string; value: string }> = [];
+        const re = /(?:^|[,;]\s*)([A-Za-z0-9_.-]+)=([^;,]*)/g;
+        let match: RegExpExecArray | null;
+        while ((match = re.exec(setCookie)) !== null) {
+            const name = match[1];
+            if (/^(path|expires|max-age|domain|samesite|secure|httponly)$/i.test(name)) continue;
+            cookies.push({ name, value: match[2] || 'present' });
+        }
+        return cookies;
+    }
+
+    private rawKeyPart(value: string): string {
+        return value.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').slice(0, 60).toLowerCase();
     }
 
     // ── HTML COMMENT PARSING ──────────────────────────────────────────────────
@@ -1242,6 +1858,13 @@ export class CmsDetectorService implements OnModuleInit {
                 { re: /bitrix/i, name: 'Bitrix', category: 'CMS' },
                 { re: /modx/i, name: 'MODX', category: 'CMS', verRe: /modx\s*([\d.]+)/i },
                 { re: /typo3/i, name: 'TYPO3', category: 'CMS', verRe: /typo3\s*([\d.]+)/i },
+                { re: /umbraco/i, name: 'Umbraco', category: 'CMS', verRe: /umbraco\s*([\d.]+)/i },
+                { re: /kentico|xperience/i, name: 'Kentico Xperience', category: 'CMS', verRe: /(?:kentico|xperience)\s*([\d.]+)/i },
+                { re: /sitecore/i, name: 'Sitecore', category: 'CMS', verRe: /sitecore\s*([\d.]+)/i },
+                { re: /adobe experience manager|\baem\b/i, name: 'Adobe Experience Manager', category: 'CMS' },
+                { re: /liferay/i, name: 'Liferay', category: 'CMS', verRe: /liferay\s*([\d.]+)/i },
+                { re: /hubspot/i, name: 'HubSpot CMS', category: 'CRM / ERP Web System' },
+                { re: /craft cms|craftcms/i, name: 'Craft CMS', category: 'CMS', verRe: /craft cms\s*([\d.]+)/i },
             ];
 
             for (const { re, name, category, verRe } of checks) {
@@ -1285,6 +1908,18 @@ export class CmsDetectorService implements OnModuleInit {
             { re: /symfony/i, name: 'Symfony', category: 'Backend Framework', confidence: 80 },
             { re: /\.AspNetCore\.(Antiforgery|Cookies|Identity|Session|Mvc)/i, name: 'ASP.NET Core', category: 'Backend Framework', confidence: 92 },
             { re: /ASP\.NET_SessionId/i, name: 'ASP.NET', category: 'Backend Framework', confidence: 90 },
+            { re: /CraftSessionId|CRAFT_CSRF_TOKEN/i, name: 'Craft CMS', category: 'CMS', confidence: 88 },
+            { re: /CONCRETE5|ccmUserHash/i, name: 'Concrete CMS', category: 'CMS', confidence: 88 },
+            { re: /PastMember|SilverStripe/i, name: 'SilverStripe', category: 'CMS', confidence: 84 },
+            { re: /UMB_UCONTEXT|UMB-XSRF|UMB_PREVIEW/i, name: 'Umbraco', category: 'CMS', confidence: 90 },
+            { re: /CMSPreferredCulture|CMSCsrfCookie|CMSCurrentTheme|CMSCookieLevel/i, name: 'Kentico Xperience', category: 'CMS', confidence: 88 },
+            { re: /SC_ANALYTICS_GLOBAL_COOKIE|sitecore/i, name: 'Sitecore', category: 'CMS', confidence: 88 },
+            { re: /GUEST_LANGUAGE_ID|LFR_SESSION_STATE|COMPANY_ID/i, name: 'Liferay', category: 'CMS', confidence: 85 },
+            { re: /\.DOTNETNUKE|dnn_IsMobile/i, name: 'DNN', category: 'CMS', confidence: 88 },
+            { re: /FedAuth|rtFa/i, name: 'SharePoint', category: 'CMS', confidence: 76 },
+            { re: /hubspotutk|__hstc|__hssc/i, name: 'HubSpot CMS', category: 'CRM / ERP Web System', confidence: 88 },
+            { re: /txp_login/i, name: 'Textpattern', category: 'CMS', confidence: 82 },
+            { re: /exp_tracker|exp_last_visit/i, name: 'ExpressionEngine', category: 'CMS', confidence: 82 },
         ];
 
         for (const { re, name, category, confidence } of cookieMap) {
@@ -1360,10 +1995,17 @@ export class CmsDetectorService implements OnModuleInit {
             { pattern: /opencart/i, name: 'OpenCart', category: 'CMS' },
             { pattern: /\/typo3\//i, name: 'TYPO3', category: 'CMS' },
             { pattern: /\/manager\//i, name: 'MODX', category: 'CMS' },
-        { pattern: /opencart/i, name: 'OpenCart', category: 'CMS' },
-        { pattern: /prestashop/i, name: 'PrestaShop', category: 'CMS' },
-        { pattern: /\/design\/themes\//i, name: 'CS-Cart', category: 'CMS' },
-        { pattern: /\/engine\/classes\//i, name: 'DLE', category: 'CMS' },
+            { pattern: /opencart/i, name: 'OpenCart', category: 'CMS' },
+            { pattern: /prestashop/i, name: 'PrestaShop', category: 'CMS' },
+            { pattern: /\/design\/themes\//i, name: 'CS-Cart', category: 'CMS' },
+            { pattern: /\/engine\/classes\//i, name: 'DLE', category: 'CMS' },
+            { pattern: /\/umbraco\//i, name: 'Umbraco', category: 'CMS' },
+            { pattern: /\/CMSPages\//i, name: 'Kentico Xperience', category: 'CMS' },
+            { pattern: /\/sitecore\//i, name: 'Sitecore', category: 'CMS' },
+            { pattern: /\/etc\.clientlibs\//i, name: 'Adobe Experience Manager', category: 'CMS' },
+            { pattern: /\/DesktopModules\//i, name: 'DNN', category: 'CMS' },
+            { pattern: /\/_layouts\/15\//i, name: 'SharePoint', category: 'CMS' },
+            { pattern: /\/o\/classic-theme\//i, name: 'Liferay', category: 'CMS' },
         ];
 
         for (const { pattern, name, category } of checks) {
@@ -1392,6 +2034,18 @@ export class CmsDetectorService implements OnModuleInit {
             signals.push({ name: 'Joomla', version: null, category: 'CMS', confidence: 70, method: 'sitemap.xml' });
         if (/\/sites\/default\//i.test(body))
             signals.push({ name: 'Drupal', version: null, category: 'CMS', confidence: 70, method: 'sitemap.xml' });
+        if (/\/umbraco\/|DependencyHandler\.axd/i.test(body))
+            signals.push({ name: 'Umbraco', version: null, category: 'CMS', confidence: 72, method: 'sitemap.xml' });
+        if (/\/CMSPages\/|\/getmedia\//i.test(body))
+            signals.push({ name: 'Kentico Xperience', version: null, category: 'CMS', confidence: 72, method: 'sitemap.xml' });
+        if (/\/sitecore\/|\/-\/media\//i.test(body))
+            signals.push({ name: 'Sitecore', version: null, category: 'CMS', confidence: 72, method: 'sitemap.xml' });
+        if (/\/etc\.clientlibs\/|\/content\/dam\//i.test(body))
+            signals.push({ name: 'Adobe Experience Manager', version: null, category: 'CMS', confidence: 72, method: 'sitemap.xml' });
+        if (/\/DesktopModules\/|\/Portals\/_default\//i.test(body))
+            signals.push({ name: 'DNN', version: null, category: 'CMS', confidence: 72, method: 'sitemap.xml' });
+        if (/hs-scripts\.com|hubspot/i.test(body))
+            signals.push({ name: 'HubSpot CMS', version: null, category: 'CRM / ERP Web System', confidence: 72, method: 'sitemap.xml' });
         // SPA-served HTML at /sitemap.xml: hint at framework
         if (/__NEXT_DATA__|\/_next\/static\//i.test(body))
             signals.push({ name: 'Next.js', version: null, category: 'Fullstack Framework', confidence: 80, method: 'sitemap.xml (SPA)' });
@@ -1435,9 +2089,132 @@ export class CmsDetectorService implements OnModuleInit {
             if (/\/assets\/components\//.test(src)) {
                 signals.push({ name: 'MODX', version: null, category: 'CMS', confidence: 80, method: 'MODX asset path' });
             }
+            if (/\/cpresources\//i.test(src)) {
+                signals.push({ name: 'Craft CMS', version: null, category: 'CMS', confidence: 82, method: 'Craft asset path' });
+            }
+            if (/\/concrete\/(js|css)\//i.test(src)) {
+                signals.push({ name: 'Concrete CMS', version: null, category: 'CMS', confidence: 82, method: 'Concrete asset path' });
+            }
+            if (/\/umbraco(_client)?\//i.test(src) || /DependencyHandler\.axd/i.test(src)) {
+                signals.push({ name: 'Umbraco', version: null, category: 'CMS', confidence: 84, method: 'Umbraco asset path' });
+            }
+            if (/\/CMSPages\/|\/CMSScripts\/|\/CMSPages\/GetResource\.ashx|\/getmedia\//i.test(src)) {
+                signals.push({ name: 'Kentico Xperience', version: null, category: 'CMS', confidence: 84, method: 'Kentico asset path' });
+            }
+            if (/\/sitecore\/|\/layouts\/system\/|\/-\/media\//i.test(src)) {
+                signals.push({ name: 'Sitecore', version: null, category: 'CMS', confidence: 84, method: 'Sitecore asset path' });
+            }
+            if (/\/etc\.clientlibs\/|\/content\/dam\/|\/libs\/granite\//i.test(src)) {
+                signals.push({ name: 'Adobe Experience Manager', version: null, category: 'CMS', confidence: 84, method: 'AEM asset path' });
+            }
+            if (/\/o\/frontend-|\/o\/classic-theme\//i.test(src)) {
+                signals.push({ name: 'Liferay', version: null, category: 'CMS', confidence: 82, method: 'Liferay asset path' });
+            }
+            if (/\/DesktopModules\/|\/Portals\/_default\//i.test(src)) {
+                signals.push({ name: 'DNN', version: null, category: 'CMS', confidence: 82, method: 'DNN asset path' });
+            }
+            if (/\/_layouts\/15\/|\/_catalogs\/|\/_vti_bin\//i.test(src)) {
+                signals.push({ name: 'SharePoint', version: null, category: 'CMS', confidence: 84, method: 'SharePoint asset path' });
+            }
+            if (/hs-scripts\.com|hsforms\.net|js\.hsforms\.net/i.test(src)) {
+                signals.push({ name: 'HubSpot CMS', version: null, category: 'CRM / ERP Web System', confidence: 86, method: 'HubSpot asset path' });
+            }
+            if (/cdn2\.editmysite\.com|weebly\.com/i.test(src)) {
+                signals.push({ name: 'Weebly', version: null, category: 'Web Builder / No-Code Platform', confidence: 82, method: 'Weebly asset path' });
+            }
+            if (/static-cdn\.multiscreensite\.com/i.test(src)) {
+                signals.push({ name: 'Duda', version: null, category: 'Web Builder / No-Code Platform', confidence: 82, method: 'Duda asset path' });
+            }
+            if (/framerusercontent\.com|data-framer-/i.test(src)) {
+                signals.push({ name: 'Framer', version: null, category: 'Web Builder / No-Code Platform', confidence: 80, method: 'Framer asset path' });
+            }
         });
 
         return signals;
+    }
+
+    private async checkLinkedAssetFingerprints(
+        baseUrl: string,
+        html: string,
+        raw: Record<string, string>,
+        timeoutMs = 20_000,
+    ): Promise<TechSignal[]> {
+        const signals: TechSignal[] = [];
+        const urls = this.extractInspectableAssetUrls(baseUrl, html);
+        if (!urls.length) return signals;
+
+        const settled = await Promise.allSettled(
+            urls.map(async assetUrl => ({ assetUrl, page: await this.fetchPage(assetUrl, 0, Math.min(timeoutMs, 8_000)) })),
+        );
+
+        for (const item of settled) {
+            if (item.status !== 'fulfilled' || !item.value.page || item.value.page.status >= 400) continue;
+            const assetUrl = item.value.assetUrl;
+            const body = item.value.page.html.slice(0, 500_000);
+
+            for (const fp of JS_BUNDLE_FINGERPRINTS) {
+                if (!fp.patterns.some(pattern => pattern.test(body))) continue;
+
+                const version = fp.versionPattern ? (body.match(fp.versionPattern)?.[1] ?? null) : null;
+                const source = this.compactAssetName(assetUrl);
+                raw[`bundle_${fp.name}_${source}`] = this.firstMatchingSnippet(body, fp.patterns) ?? source;
+                signals.push({
+                    name: fp.name,
+                    version,
+                    category: fp.category as SiteCategory,
+                    confidence: fp.confidence,
+                    method: `JS bundle: ${source}`,
+                    source,
+                });
+            }
+        }
+
+        return signals;
+    }
+
+    private extractInspectableAssetUrls(baseUrl: string, html: string): string[] {
+        const $ = cheerio.load(html);
+        const base = new URL(baseUrl);
+        const urls = new Set<string>();
+
+        $('script[src], link[rel="modulepreload"][href]').each((_, el) => {
+            const raw = $(el).attr('src') || $(el).attr('href') || '';
+            if (!raw || raw.startsWith('data:')) return;
+
+            try {
+                const url = new URL(raw, baseUrl);
+                if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+                if (url.origin !== base.origin && !this.isKnownInspectableAssetHost(url.hostname)) return;
+                if (!/\.m?js(?:$|[?#])|\/_next\/static\/|\/_nuxt\/|\/assets\//i.test(url.pathname)) return;
+                urls.add(url.toString());
+            } catch { /* ignore malformed asset URLs */ }
+        });
+
+        return Array.from(urls).slice(0, 6);
+    }
+
+    private isKnownInspectableAssetHost(hostname: string): boolean {
+        return /(^|\.)((shopifycdn|contentful|storyblok|hygraph|graphcms|directus)\.com|sanity\.io|ctfassets\.net)$/i.test(hostname);
+    }
+
+    private compactAssetName(assetUrl: string): string {
+        try {
+            const url = new URL(assetUrl);
+            const parts = url.pathname.split('/').filter(Boolean);
+            return parts.slice(-2).join('/') || url.hostname;
+        } catch {
+            return assetUrl.slice(0, 80);
+        }
+    }
+
+    private firstMatchingSnippet(body: string, patterns: RegExp[]): string | null {
+        for (const pattern of patterns) {
+            const match = body.match(pattern);
+            if (!match) continue;
+            const index = Math.max(0, match.index ?? 0);
+            return body.slice(index, index + 140);
+        }
+        return null;
     }
 
     // ── META GENERATOR ────────────────────────────────────────────────────────
@@ -1472,6 +2249,28 @@ export class CmsDetectorService implements OnModuleInit {
             { pattern: /CS-Cart\s*([\d.]*)/i, name: 'CS-Cart', category: 'CMS' },
             { pattern: /DataLife Engine\s*([\d.]*)/i, name: 'DLE', category: 'CMS' },
             { pattern: /UMI\.CMS\s*([\d.]*)/i, name: 'UMI.CMS', category: 'CMS' },
+            { pattern: /Craft CMS\s*([\d.]*)/i, name: 'Craft CMS', category: 'CMS' },
+            { pattern: /Concrete(?:5| CMS)?\s*([\d.]*)/i, name: 'Concrete CMS', category: 'CMS' },
+            { pattern: /SilverStripe\s*([\d.]*)/i, name: 'SilverStripe', category: 'CMS' },
+            { pattern: /Umbraco\s*([\d.]*)/i, name: 'Umbraco', category: 'CMS' },
+            { pattern: /Kentico\s*([\d.]*)/i, name: 'Kentico Xperience', category: 'CMS' },
+            { pattern: /Xperience\s*([\d.]*)/i, name: 'Kentico Xperience', category: 'CMS' },
+            { pattern: /Sitecore\s*([\d.]*)/i, name: 'Sitecore', category: 'CMS' },
+            { pattern: /Adobe Experience Manager\s*([\d.]*)/i, name: 'Adobe Experience Manager', category: 'CMS' },
+            { pattern: /Liferay\s*([\d.]*)/i, name: 'Liferay', category: 'CMS' },
+            { pattern: /DotNetNuke\s*([\d.]*)/i, name: 'DNN', category: 'CMS' },
+            { pattern: /\bDNN\s*([\d.]*)/i, name: 'DNN', category: 'CMS' },
+            { pattern: /Orchard Core\s*([\d.]*)/i, name: 'Orchard Core', category: 'CMS' },
+            { pattern: /Microsoft SharePoint\s*([\d.]*)/i, name: 'SharePoint', category: 'CMS' },
+            { pattern: /Plone\s*([\d.]*)/i, name: 'Plone', category: 'CMS' },
+            { pattern: /HubSpot\s*([\d.]*)/i, name: 'HubSpot CMS', category: 'CRM / ERP Web System' },
+            { pattern: /Blogger\s*([\d.]*)/i, name: 'Blogger', category: 'Blog Engine' },
+            { pattern: /Weebly\s*([\d.]*)/i, name: 'Weebly', category: 'Web Builder / No-Code Platform' },
+            { pattern: /Duda\s*([\d.]*)/i, name: 'Duda', category: 'Web Builder / No-Code Platform' },
+            { pattern: /Framer\s*([\d.]*)/i, name: 'Framer', category: 'Web Builder / No-Code Platform' },
+            { pattern: /Textpattern\s*([\d.]*)/i, name: 'Textpattern', category: 'CMS' },
+            { pattern: /ExpressionEngine\s*([\d.]*)/i, name: 'ExpressionEngine', category: 'CMS' },
+            { pattern: /Statamic\s*([\d.]*)/i, name: 'Statamic', category: 'CMS' },
         ];
 
         for (const { pattern, name, category } of matchers) {
@@ -1498,11 +2297,14 @@ export class CmsDetectorService implements OnModuleInit {
 
         for (const tech of group) {
             let matchCount = 0;
+            let htmlMatchCount = 0;
+            let headerMatchCount = 0;
             let version: string | null = null;
 
             for (const pattern of tech.patterns || []) {
                 if (pattern.test(html)) {
                     matchCount++;
+                    htmlMatchCount++;
                     raw[`html_${tech.name}_${matchCount}`] = pattern.toString();
                 }
             }
@@ -1511,6 +2313,7 @@ export class CmsDetectorService implements OnModuleInit {
                 const val = headers[hk.key.toLowerCase()] || '';
                 if (hk.pattern.test(val)) {
                     matchCount++;
+                    headerMatchCount++;
                     raw[`header_${tech.name}`] = val;
                     if (hk.versionPattern) {
                         const m = val.match(hk.versionPattern);
@@ -1531,10 +2334,14 @@ export class CmsDetectorService implements OnModuleInit {
                 // HTML patterns alone = "soft" evidence; base starts low
                 const baseConf = category === 'CMS' ? 50 : 42;
                 const bonus = Math.min(matchCount - 1, 4) * 4;  // +4 per extra match, max +16
+                const methodParts = [
+                    htmlMatchCount ? `Pattern (${htmlMatchCount} match)` : '',
+                    headerMatchCount ? `Header (${headerMatchCount} match)` : '',
+                ].filter(Boolean);
                 signals.push({
                     name: tech.name, version, category,
                     confidence: baseConf + bonus,
-                    method: `Pattern (${matchCount} match)`,
+                    method: methodParts.join(' + '),
                 });
             }
         }
@@ -1542,30 +2349,63 @@ export class CmsDetectorService implements OnModuleInit {
     }
 
     // ── FILE PROBES ───────────────────────────────────────────────────────────
-    private async checkCmsFileProbes(baseUrl: string, raw: Record<string, string>, candidates?: string[]): Promise<TechSignal[]> {
+    private async checkCmsFileProbes(
+        baseUrl: string,
+        raw: Record<string, string>,
+        candidates?: string[],
+        timeoutMs = 20_000,
+    ): Promise<TechSignal[]> {
         const cmsList = candidates && candidates.length
             ? this.CMS_PATTERNS.filter(c => candidates.includes(c.name))
             : this.CMS_PATTERNS;
-        const probes: Array<{ path: string; name: string; extractor: (b: string) => string | null }> = [];
+        const probes: Array<{
+            path: string;
+            name: string;
+            category: SiteCategory;
+            confidence: number;
+            allowErrorStatus?: boolean;
+            extractor: (b: string, status: number, headers: Record<string, string>) => string | null;
+        }> = [];
         for (const cms of cmsList) {
             for (const fp of cms.fileProbes || []) {
-                probes.push({ path: fp.path, name: cms.name, extractor: fp.extractor });
+                probes.push({
+                    path: fp.path,
+                    name: cms.name,
+                    category: this.CMS_CATEGORY_MAP[cms.name] ?? 'CMS',
+                    confidence: 88,
+                    extractor: body => fp.extractor(body),
+                });
             }
+        }
+
+        const supplemental = candidates && candidates.length
+            ? SUPPLEMENTAL_CMS_FILE_PROBES.filter(probe => candidates.includes(probe.name))
+            : SUPPLEMENTAL_CMS_FILE_PROBES;
+        for (const probe of supplemental) {
+            probes.push({
+                path: probe.path,
+                name: probe.name,
+                category: probe.category as SiteCategory,
+                confidence: probe.confidence,
+                allowErrorStatus: probe.allowErrorStatus,
+                extractor: probe.extractor,
+            });
         }
 
         const results = await Promise.allSettled(
             probes.map(async (probe) => {
-                const res = await this.fetchPage(baseUrl + probe.path);
-                if (!res || res.status >= 400) return null;
-                const version = probe.extractor(res.html);
+                const res = await this.fetchPage(baseUrl + probe.path, 0, Math.min(timeoutMs, 8_000));
+                if (!res || res.status >= 500 || (res.status >= 400 && !probe.allowErrorStatus)) return null;
+                const version = probe.extractor(res.html, res.status, res.headers);
                 if (!version) return null;
-                raw[`file_${probe.name}_${probe.path}`] = res.html.slice(0, 150);
+                raw[`file_${probe.name}_${probe.path}`] = `HTTP ${res.status}: ${res.html.slice(0, 140)}`;
                 return {
                     name: probe.name,
                     version: version === 'detected' ? null : version,
-                    category: 'CMS' as SiteCategory,
-                    confidence: version !== 'detected' ? 95 : 88,
+                    category: probe.category,
+                    confidence: version !== 'detected' ? 95 : probe.confidence,
                     method: `File probe: ${probe.path}`,
+                    source: probe.path,
                 };
             }),
         );
@@ -1622,29 +2462,20 @@ export class CmsDetectorService implements OnModuleInit {
     ): CmsDetectionResult {
         if (!signals.length) {
             const noSigCat = this.determineDetailedCategory(null, 'Unknown', html, headers, serverTech);
-            return { url, cms: null, version: null, category: noSigCat, confidence: 0, detectionMethod: [], detectedAt: new Date(), rawSignals, serverTech, jsFrameworks, httpStatus, pageTitle };
+            return { url, cms: null, version: null, versionSource: null, category: noSigCat, confidence: 0, detectionMethod: [], evidence: [], detectedAt: new Date(), rawSignals, serverTech, jsFrameworks, httpStatus, pageTitle };
         }
 
-        const scores: Record<string, { max: number; versions: string[]; methods: string[]; category: SiteCategory; evidenceTypes: Set<string> }> = {};
+        const scores: Record<string, { max: number; versions: string[]; methods: string[]; category: SiteCategory; evidenceTypes: Set<EvidenceType>; signals: TechSignal[] }> = {};
 
         for (const s of signals) {
-            if (!scores[s.name]) scores[s.name] = { max: 0, versions: [], methods: [], category: s.category, evidenceTypes: new Set() };
+            if (!scores[s.name]) scores[s.name] = { max: 0, versions: [], methods: [], category: s.category, evidenceTypes: new Set(), signals: [] };
             // Keep the highest single-signal confidence (no summing)
             if (s.confidence > scores[s.name].max) scores[s.name].max = s.confidence;
             if (s.version) scores[s.name].versions.push(s.version);
             scores[s.name].methods.push(s.method);
+            scores[s.name].signals.push(s);
             // Track distinct evidence category for bonus calculation
-            const eType = s.method.startsWith('File probe') || s.method.startsWith('RSS')
-                ? 'file'
-                : s.method === 'meta generator'   ? 'meta'
-                : s.method === 'Cookie'            ? 'cookie'
-                : s.method === 'Inline version'    ? 'inline'
-                : s.method.startsWith('Header')    ? 'header'
-                : s.method.startsWith('Asset') || s.method.includes('asset') ? 'asset'
-                : s.method.includes('robots') || s.method.includes('sitemap') ? 'crawl'
-                : s.method.includes('HTML comment') ? 'comment'
-                : 'pattern';
-            scores[s.name].evidenceTypes.add(eType);
+            scores[s.name].evidenceTypes.add(this.signalEvidenceType(s.method));
         }
 
         // Sort by (max confidence + evidence-type bonus) descending
@@ -1656,13 +2487,16 @@ export class CmsDetectorService implements OnModuleInit {
         const [topName, data] = sorted[0];
 
         // Require at least 40 base confidence to report a CMS
-        if (data.max < 40) {
+        if (data.max < 40 || this.isWeakPatternOnlyDetection(topName, data)) {
             const lowSigCat = this.determineDetailedCategory(null, 'Custom / Proprietary System', html, headers, serverTech);
-            return { url, cms: null, version: null, category: lowSigCat, confidence: 0, detectionMethod: ['No known tech detected'], detectedAt: new Date(), rawSignals, serverTech, jsFrameworks, httpStatus, pageTitle };
+            return { url, cms: null, version: null, versionSource: null, category: lowSigCat, confidence: 0, detectionMethod: ['No known tech detected'], evidence: [], detectedAt: new Date(), rawSignals, serverTech, jsFrameworks, httpStatus, pageTitle };
         }
 
         // Versiyani tanlash: file probe/inline > meta generator > asset URL
-        const version = this.resolveVersion(data.versions, signals.filter(s => s.name === topName));
+        const versionInfo = this.resolveVersionInfo(data.signals);
+        const evidence = this.buildEvidence(topName, data.signals);
+        rawSignals['_evidence'] = JSON.stringify(evidence);
+        if (versionInfo.source) rawSignals['_version_source'] = versionInfo.source;
 
         // Final confidence: best signal + bonus per additional independent evidence type, cap 97
         const typeBonus = Math.min((data.evidenceTypes.size - 1) * 6, 18);
@@ -1670,26 +2504,75 @@ export class CmsDetectorService implements OnModuleInit {
 
         return {
             url, cms: topName,
-            version,
+            version: versionInfo.version,
+            versionSource: versionInfo.source,
             category: this.determineDetailedCategory(topName, data.category, html, headers, serverTech),
             confidence: finalConfidence,
             detectionMethod: [...new Set(data.methods)],
+            evidence,
             detectedAt: new Date(), rawSignals, serverTech, jsFrameworks, httpStatus, pageTitle,
         };
     }
 
-    private resolveVersion(versions: string[], signals: TechSignal[]): string | null {
-        if (!versions.length) return null;
+    private signalEvidenceType(method: string): EvidenceType {
+        if (method.startsWith('File probe') || method.startsWith('RSS')) return 'file';
+        if (method === 'meta generator' || method.startsWith('Wappalyzer meta')) return 'meta';
+        if (method === 'Cookie' || method.startsWith('Wappalyzer cookie')) return 'cookie';
+        if (method === 'Inline version') return 'inline';
+        if (method.includes('Header') || method.startsWith('Wappalyzer header')) return 'header';
+        if (method.startsWith('Asset') || method.includes('asset') || method.startsWith('Wappalyzer scriptSrc')) return 'asset';
+        if (method.startsWith('JS bundle') || method.startsWith('Wappalyzer scripts')) return 'bundle';
+        if (method.includes('robots') || method.includes('sitemap')) return 'crawl';
+        if (method.includes('HTML comment')) return 'comment';
+        if (method.startsWith('Pattern') || method.startsWith('Wappalyzer html') || method.startsWith('Wappalyzer text') || method.startsWith('Wappalyzer url') || method.startsWith('Wappalyzer dom')) return 'pattern';
+        return 'other';
+    }
 
-        // Eng ishonchli manba tartibida versiya tanlash
-        const priority = ['File probe', 'meta generator', 'Inline version', 'Asset ?ver=', 'RSS feed'];
-        for (const p of priority) {
-            const s = signals.find(sig => sig.version && sig.method.includes(p.split(' ')[0]));
-            if (s?.version) return s.version;
+    private isWeakPatternOnlyDetection(
+        name: string,
+        data: { max: number; category: SiteCategory; evidenceTypes: Set<EvidenceType> },
+    ): boolean {
+        if (data.category !== 'CMS') return false;
+        if (STRONG_PATTERN_ONLY_TECHS.has(name)) return false;
+        return data.evidenceTypes.size === 1 && data.evidenceTypes.has('pattern') && data.max < 58;
+    }
+
+    private buildEvidence(name: string, signals: TechSignal[]): DetectionEvidence[] {
+        return signals
+            .sort((a, b) => b.confidence - a.confidence)
+            .map(signal => ({
+                name,
+                method: signal.method,
+                type: this.signalEvidenceType(signal.method),
+                confidence: signal.confidence,
+                version: signal.version,
+                source: signal.source ?? null,
+            }));
+    }
+
+    private resolveVersionInfo(signals: TechSignal[]): { version: string | null; source: string | null } {
+        const versioned = signals.filter(signal => signal.version);
+        if (!versioned.length) return { version: null, source: null };
+
+        const priority = [
+            'File probe',
+            'Inline version',
+            'meta generator',
+            'Asset ?ver=',
+            'JS bundle',
+            'RSS feed',
+            'Pattern',
+            'Header',
+        ];
+        for (const marker of priority) {
+            const signal = versioned.find(sig => sig.method.includes(marker));
+            if (signal?.version) return { version: signal.version, source: signal.method };
         }
 
-        // Fallback: eng uzun versiya (ko'proq raqam = aniqroq)
-        return versions.sort((a, b) => b.split('.').length - a.split('.').length)[0];
+        const fallback = versioned.sort((a, b) =>
+            (b.version ?? '').split('.').length - (a.version ?? '').split('.').length,
+        )[0];
+        return { version: fallback.version, source: fallback.method };
     }
 
     // ── SITE NAME EXTRACTION ──────────────────────────────────────────────────
@@ -1759,11 +2642,13 @@ export class CmsDetectorService implements OnModuleInit {
 
         // 7. Pass through new detailed categories as-is
         const passthrough: SiteCategory[] = [
-            'CMS', 'E-commerce CMS', 'Backend Framework', 'Fullstack Framework',
-            'Headless CMS', 'Static Website', 'Static Site Generator (SSG)',
+            'CMS', 'E-commerce CMS', 'Backend Framework', 'Frontend Framework / SPA',
+            'Fullstack Framework', 'Headless CMS', 'Static Website', 'Static Site Generator (SSG)',
+            'Jamstack', 'Server-Side Rendered (SSR)', 'Progressive Web App (PWA)',
             'Forum Engine', 'Wiki Engine', 'Blog Engine',
             'Learning Management System (LMS)', 'CRM / ERP Web System',
             'Web Builder / No-Code Platform', 'Custom / Proprietary System',
+            'API-only Backend', 'Unknown',
         ];
         if ((passthrough as string[]).includes(fallbackCategory)) return fallbackCategory as SiteCategory;
 
@@ -1778,6 +2663,7 @@ export class CmsDetectorService implements OnModuleInit {
     private async fetchPage(
         url: string,
         attempt = 0,
+        timeoutMs = 20_000,
     ): Promise<{ html: string; headers: Record<string, string>; status: number } | null> {
         // Skip if domain is in 429/403 cooldown
         if (this.getDomainCooldown(url) > 0) return null;
@@ -1786,9 +2672,12 @@ export class CmsDetectorService implements OnModuleInit {
         const { agent: proxyAgent, proxyUrl } = bare
             ? { agent: undefined, proxyUrl: null as string | null }
             : this.getNextAgent();
+        const usingProxy = !!proxyUrl && !!proxyAgent && !bare;
+        const requestTimeoutMs = usingProxy ? Math.min(timeoutMs, this.proxyFetchTimeoutMs) : timeoutMs;
         try {
             const res: AxiosResponse = await axios.get(url, {
-                timeout: 20_000,
+                timeout: requestTimeoutMs,
+                signal: AbortSignal.timeout(requestTimeoutMs),
                 maxRedirects: 5,
                 maxContentLength: 5 * 1024 * 1024,
                 maxBodyLength: 5 * 1024 * 1024,
@@ -1808,6 +2697,11 @@ export class CmsDetectorService implements OnModuleInit {
                 validateStatus: () => true,
             });
 
+            if (usingProxy && this.isProxySuspectResponse(res.status, res.data) && attempt < 1) {
+                this.reportProxyResult(proxyUrl, false);
+                return this.fetchPage(url, attempt + 1, timeoutMs);
+            }
+
             // Per-domain cooldown for 429/403
             if (res.status === 429 || res.status === 403) {
                 this.setDomainCooldown(url);
@@ -1817,7 +2711,7 @@ export class CmsDetectorService implements OnModuleInit {
 
             return {
                 html: typeof res.data === 'string' ? res.data : JSON.stringify(res.data),
-                headers: res.headers as Record<string, string>,
+                headers: this.normalizeHeaders(res.headers as Record<string, string>),
                 status: res.status,
             };
         } catch (err: any) {
@@ -1829,10 +2723,11 @@ export class CmsDetectorService implements OnModuleInit {
                 code === 'ECONNABORTED' || code === 'EAI_AGAIN' ||
                 code === 'ERR_BAD_RESPONSE' || code === 'EPROTO' ||
                 code === 'ERR_BROTLI_DECOMPRESSION_FAILED' ||
-                code === 'Z_BUF_ERROR' || code === 'Z_DATA_ERROR';
-            if (transient && attempt < 1) {
-                await new Promise(r => setTimeout(r, 300));
-                return this.fetchPage(url, attempt + 1);
+                code === 'Z_BUF_ERROR' || code === 'Z_DATA_ERROR' ||
+                code === 'ERR_CANCELED' || code === 'ABORT_ERR';
+            if ((proxyUrl || transient) && attempt < 1) {
+                if (!proxyUrl) await new Promise(r => setTimeout(r, 300));
+                return this.fetchPage(url, attempt + 1, timeoutMs);
             }
             return null;
         }
@@ -1862,6 +2757,22 @@ export class CmsDetectorService implements OnModuleInit {
 
     private randomUserAgent(): string {
         return this.USER_AGENTS[Math.floor(Math.random() * this.USER_AGENTS.length)];
+    }
+
+    private normalizeHeaders(headers: Record<string, any>): Record<string, string> {
+        const normalized: Record<string, string> = {};
+        for (const [key, value] of Object.entries(headers || {})) {
+            normalized[key.toLowerCase()] = Array.isArray(value) ? value.join('; ') : String(value);
+        }
+        return normalized;
+    }
+
+    private normalizeTimeout(timeoutMs: number | undefined, mode: 'FAST' | 'FULL'): number {
+        const fallback = mode === 'FAST' ? 5_000 : 20_000;
+        const raw = Number(timeoutMs || fallback);
+        const min = mode === 'FAST' ? 2_000 : 5_000;
+        const max = mode === 'FAST' ? 15_000 : 30_000;
+        return Math.min(max, Math.max(min, Number.isFinite(raw) ? Math.round(raw) : fallback));
     }
 
     private normalizeUrl(url: string): string {

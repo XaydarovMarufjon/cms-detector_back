@@ -18,6 +18,8 @@ model User {
 
   sessions  Session[]
   auditLogs AuditLog[]
+  assignedTasks SecurityTask[] @relation("TaskAssignee")
+  createdTasks  SecurityTask[] @relation("TaskCreator")
 
   @@map("users")
 }
@@ -85,6 +87,22 @@ enum FeedType {
   VIRUSTOTAL
 }
 
+enum BulkScanJobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  CANCELLED
+  FAILED
+}
+
+enum BulkScanItemStatus {
+  PENDING
+  RUNNING
+  DONE
+  FAILED
+  SKIPPED
+}
+
 model ThreatFeed {
   id         String    @id @default(uuid())
   name       String
@@ -131,11 +149,27 @@ model Website {
   label         String?
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt
+  cveScannedAt        DateTime?
+  subdomainsScannedAt DateTime?
   scans         ScanResult[]
   nucleiResults NucleiResult[]
   subdomains    SubdomainCache[]
+  portScans     PortScanResult[]
+  defacementSnapshot DefacementSnapshot?
+  tasks         SecurityTask[]
+  bulkScanItems BulkScanJobItem[]
 
   @@map("websites")
+}
+
+model UrlCheckerSite {
+  id        String   @id @default(uuid())
+  url       String   @unique
+  label     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("url_checker_sites")
 }
 
 model SubdomainCache {
@@ -201,12 +235,158 @@ model NucleiResult {
   name        String
   description String?
   matchedAt   String?
+  source      String    @default("NUCLEI")
+  confidence  Int       @default(90)
+  evidence    Json      @default("{}")
+  referenceUrl String?
   scannedAt   DateTime  @default(now())
   status      CveStatus @default(PENDING)
   website     Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
 
   @@index([websiteId])
+  @@index([cveId])
+  @@index([source])
   @@map("nuclei_results")
+}
+
+model PortScanResult {
+  id        String   @id @default(uuid())
+  websiteId String
+  host      String
+  port      Int
+  protocol  String   @default("TCP")
+  status    String
+  service   String?
+  latencyMs Int?
+  error     String?
+  scanId    String
+  scannedAt DateTime @default(now())
+  website   Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId])
+  @@index([scanId])
+  @@index([host, port])
+  @@map("port_scan_results")
+}
+
+model DefacementSnapshot {
+  id                  String   @id @default(uuid())
+  websiteId           String   @unique
+  domain              String
+  url                 String
+  title               String?
+  titleHash           String?
+  contentHash         String
+  structuralHash      String?
+  textLength          Int      @default(0)
+  assetCount          Int      @default(0)
+  formCount           Int      @default(0)
+  scriptCount         Int      @default(0)
+  keywordHits         String[] @default([])
+  status              String   @default("BASELINE")
+  changeScore         Int      @default(0)
+  changeReasons       String[] @default([])
+  previousTitle       String?
+  previousContentHash String?
+  lastChangedAt       DateTime?
+  lastCheckedAt       DateTime @default(now())
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  website             Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([domain])
+  @@index([status])
+  @@index([lastChangedAt])
+  @@map("defacement_snapshots")
+}
+
+model SecurityTask {
+  id          String   @id @default(uuid())
+  title       String
+  description String?
+  source      String   @default("MANUAL")
+  status      String   @default("OPEN")
+  priority    String   @default("MEDIUM")
+  dueDate     DateTime?
+  websiteId   String?
+  assigneeId  String?
+  createdById String?
+  website     Website? @relation(fields: [websiteId], references: [id], onDelete: SetNull)
+  assignee    User?    @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  createdBy   User?    @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status])
+  @@index([priority])
+  @@index([assigneeId])
+  @@index([websiteId])
+  @@map("security_tasks")
+}
+
+model BulkScanJob {
+  id                       String            @id @default(uuid())
+  status                   BulkScanJobStatus @default(PENDING)
+  mode                     String            @default("FAST")
+  concurrency              Int               @default(16)
+  timeoutMs                Int               @default(5000)
+  includeRecentlyScanned   Boolean           @default(false)
+  skipRecentHours          Int               @default(6)
+  total                    Int               @default(0)
+  pending                  Int               @default(0)
+  running                  Int               @default(0)
+  completed                Int               @default(0)
+  failed                   Int               @default(0)
+  skipped                  Int               @default(0)
+  errorMessage             String?
+  startedAt                DateTime?
+  finishedAt               DateTime?
+  createdAt                DateTime          @default(now())
+  updatedAt                DateTime          @updatedAt
+  items                    BulkScanJobItem[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("bulk_scan_jobs")
+}
+
+model BulkScanJobItem {
+  id           String             @id @default(uuid())
+  jobId        String
+  websiteId    String
+  url          String
+  status       BulkScanItemStatus @default(PENDING)
+  scanResultId String?
+  errorMessage String?
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  job          BulkScanJob        @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  website      Website            @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, websiteId])
+  @@index([jobId])
+  @@index([websiteId])
+  @@index([status])
+  @@map("bulk_scan_job_items")
+}
+
+model AutoScanState {
+  id                  String    @id @default(uuid())
+  key                 String    @unique
+  cursorWebsiteId     String?
+  intervalMinutes     Int       @default(360)
+  lastStartedAt       DateTime?
+  lastFinishedAt      DateTime?
+  lastStatus          String?
+  lastError           String?
+  scannedInLastWindow Int       @default(0)
+  totalAtLastWindow   Int       @default(0)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@map("auto_scan_states")
 }
 
 model CallCategory {

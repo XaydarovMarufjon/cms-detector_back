@@ -9,10 +9,12 @@ import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { ThreatIntelService } from './threat-intel.service';
+import { CveCorrelationService } from './cve-correlation.service';
 
 const execFileAsync = promisify(execFile);
 
 export interface NucleiHit {
+  websiteId?:    string;
   templateId:  string;
   cveId:       string | null;
   severity:    string;
@@ -20,6 +22,10 @@ export interface NucleiHit {
   description: string | null;
   matchedAt:   string | null;
   subdomain:   string;
+  source?:      string;
+  confidence?:  number;
+  referenceUrl?: string | null;
+  evidence?:    Record<string, any>;
 }
 
 const SEVERITY_ORDER: Record<string, number> = {
@@ -64,6 +70,7 @@ export class NucleiService {
     private readonly prisma:       PrismaService,
     private readonly scheduler:    SchedulerRegistry,
     private readonly threatIntel:  ThreatIntelService,
+    private readonly cveCorrelation: CveCorrelationService,
   ) {
     this.startScheduledJob();
   }
@@ -146,6 +153,7 @@ export class NucleiService {
       }
 
       const targets = this.normalizeTargets(websites.map(s => s.url));
+      const targetsByWebsite = new Map(websites.map(site => [site.id, [site.url]]));
 
       // Show first site as "current" while full scan runs
       this.progress.currentSite  = `${websites.length} ta sayt skanlanmoqda...`;
@@ -156,8 +164,20 @@ export class NucleiService {
         where: { websiteId: { in: websites.map(s => s.id) } },
       });
 
-      // Single nuclei invocation for all targets
-      const hits = await this.runNuclei(targets);
+      // Single nuclei invocation for all targets. If the binary is missing or
+      // templates fail, keep passive CVE correlation working from stored scan data.
+      let nucleiHits: NucleiHit[] = [];
+      try {
+        nucleiHits = await this.runNuclei(targets);
+      } catch (err) {
+        this.logger.warn(`Nuclei active scan failed, passive CVE lookup will continue: ${String(err)}`);
+      }
+
+      const passiveHits = await this.cveCorrelation.correlateWebsites(
+        websites.map(site => site.id),
+        targetsByWebsite,
+      );
+      const hits = this.mergeHits([...nucleiHits, ...passiveHits]);
 
       // Group hits by websiteId
       const byWebsite = new Map<string, NucleiHit[]>();
@@ -166,9 +186,10 @@ export class NucleiService {
           urlMap.get(hit.subdomain) ??
           urlMap.get(`https://${hit.subdomain}`) ??
           urlMap.get(`http://${hit.subdomain}`);
-        if (!match) continue;
-        if (!byWebsite.has(match.id)) byWebsite.set(match.id, []);
-        byWebsite.get(match.id)!.push(hit);
+        const websiteId = hit.websiteId ?? match?.id;
+        if (!websiteId) continue;
+        if (!byWebsite.has(websiteId)) byWebsite.set(websiteId, []);
+        byWebsite.get(websiteId)!.push(hit);
       }
 
       // Save to DB
@@ -179,7 +200,7 @@ export class NucleiService {
               urlMap.get(h.subdomain) ??
               urlMap.get(`https://${h.subdomain}`) ??
               urlMap.get(`http://${h.subdomain}`);
-            const websiteId = match?.id ?? websites[0].id;
+            const websiteId = h.websiteId ?? match?.id ?? websites[0].id;
             return this.prisma.nucleiResult.create({
               data: {
                 websiteId,
@@ -190,6 +211,10 @@ export class NucleiService {
                 name:        h.name,
                 description: h.description,
                 matchedAt:   h.matchedAt,
+                source:      h.source ?? 'NUCLEI',
+                confidence:  h.confidence ?? 95,
+                referenceUrl: h.referenceUrl ?? null,
+                evidence:    h.evidence ?? {},
               },
             });
           }),
@@ -207,6 +232,7 @@ export class NucleiService {
         });
       }
       this.progress.currentIndex = websites.length;
+      await this.markCveScansCompleted(websites.map(site => site.id));
 
       // Auto-enrich found CVEs (non-blocking)
       const cveIds = [...new Set(hits.map(h => h.cveId).filter(Boolean))] as string[];
@@ -267,13 +293,24 @@ export class NucleiService {
   async scan(
     websiteId: string,
     subdomains: string[],
-    replaceExisting = false,
+    replaceExisting = true,
   ): Promise<NucleiHit[]> {
+    if (!subdomains.length) {
+      const website = await this.prisma.website.findUnique({ where: { id: websiteId } });
+      if (website?.url) subdomains = [website.url];
+    }
     if (!subdomains.length) return [];
 
     const targets = this.expandTargets(subdomains);
 
-    const hits = await this.runNuclei(targets);
+    let nucleiHits: NucleiHit[] = [];
+    try {
+      nucleiHits = await this.runNuclei(targets);
+    } catch (err) {
+      this.logger.warn(`Nuclei active scan failed for ${websiteId}, passive CVE lookup will continue: ${String(err)}`);
+    }
+    const passiveHits = await this.cveCorrelation.correlateWebsite(websiteId, targets);
+    const hits = this.mergeHits([...nucleiHits, ...passiveHits]);
 
     if (replaceExisting) {
       await this.prisma.nucleiResult.deleteMany({ where: { websiteId } });
@@ -292,17 +329,45 @@ export class NucleiService {
               name:        h.name,
               description: h.description,
               matchedAt:   h.matchedAt,
+              source:      h.source ?? 'NUCLEI',
+              confidence:  h.confidence ?? 95,
+              referenceUrl: h.referenceUrl ?? null,
+              evidence:    h.evidence ?? {},
             },
           }),
         ),
       );
     }
+    await this.markCveScanCompleted(websiteId);
 
     // Auto-enrich found CVEs (non-blocking)
     const cveIds = [...new Set(hits.map(h => h.cveId).filter(Boolean))] as string[];
     if (cveIds.length) this.enrichCvesBackground(cveIds);
 
     return hits;
+  }
+
+  private async markCveScanCompleted(websiteId: string) {
+    try {
+      await this.prisma.website.update({
+        where: { id: websiteId },
+        data: { cveScannedAt: new Date() },
+      });
+    } catch (err) {
+      this.logger.warn(`CVE scan completion save failed for ${websiteId}: ${String(err)}`);
+    }
+  }
+
+  private async markCveScansCompleted(websiteIds: string[]) {
+    if (!websiteIds.length) return;
+    try {
+      await this.prisma.website.updateMany({
+        where: { id: { in: websiteIds } },
+        data: { cveScannedAt: new Date() },
+      });
+    } catch (err) {
+      this.logger.warn(`CVE scan completion save failed: ${String(err)}`);
+    }
   }
 
   private enrichCvesBackground(cveIds: string[]) {
@@ -335,8 +400,10 @@ export class NucleiService {
     try {
       await writeFile(tmpFile, targets.join('\n'), 'utf8');
 
-      // 3 min per target, min 5 min
-      const timeoutMs = Math.max(300_000, targets.length * 180_000);
+      const perTargetMs = Math.min(180_000, Math.max(20_000, Number(process.env['NUCLEI_TARGET_TIMEOUT_MS'] || 45_000)));
+      const minTimeoutMs = Math.min(120_000, Math.max(20_000, Number(process.env['NUCLEI_MIN_TIMEOUT_MS'] || 45_000)));
+      const maxTimeoutMs = Math.min(30 * 60_000, Math.max(minTimeoutMs, Number(process.env['NUCLEI_MAX_TIMEOUT_MS'] || 15 * 60_000)));
+      const timeoutMs = Math.min(maxTimeoutMs, Math.max(minTimeoutMs, targets.length * perTargetMs));
 
       for (const bin of NUCLEI_BINS) {
         try {
@@ -398,10 +465,38 @@ export class NucleiService {
           description: info['description'] ?? null,
           matchedAt:   matchedAt || null,
           subdomain:   this.extractHost(matchedAt),
+          source:      'NUCLEI',
+          confidence:  95,
+          referenceUrl: null,
+          evidence: {
+            templateId,
+            matcherName: obj['matcher-name'] ?? null,
+            templateUrl: obj['template-url'] ?? null,
+            type: obj['type'] ?? null,
+          },
         });
       } catch { /* skip non-JSON */ }
     }
     return hits;
+  }
+
+  private mergeHits(hits: NucleiHit[]): NucleiHit[] {
+    const rank: Record<string, number> = { NUCLEI: 0, LOCAL_RULE: 1, OSV: 2, NVD: 3 };
+    const map = new Map<string, NucleiHit>();
+    for (const hit of hits) {
+      const key = `${hit.websiteId ?? ''}:${hit.subdomain}:${hit.cveId ?? hit.templateId}`;
+      const current = map.get(key);
+      if (!current) {
+        map.set(key, hit);
+        continue;
+      }
+      const currentRank = rank[current.source ?? 'NUCLEI'] ?? 9;
+      const hitRank = rank[hit.source ?? 'NUCLEI'] ?? 9;
+      if (hitRank < currentRank || (hit.confidence ?? 0) > (current.confidence ?? 0)) {
+        map.set(key, hit);
+      }
+    }
+    return [...map.values()];
   }
 
   private extractHost(url: string): string {
