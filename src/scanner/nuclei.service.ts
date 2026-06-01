@@ -153,7 +153,7 @@ export class NucleiService {
       }
 
       const targets = this.normalizeTargets(websites.map(s => s.url));
-      const targetsByWebsite = new Map(websites.map(site => [site.id, [site.url]]));
+      const targetsByWebsite = new Map<string, string[]>(websites.map(site => [site.id, [site.url]]));
 
       // Show first site as "current" while full scan runs
       this.progress.currentSite  = `${websites.length} ta sayt skanlanmoqda...`;

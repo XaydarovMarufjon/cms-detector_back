@@ -23,6 +23,81 @@ const SERVICE_NAMES: Record<number, string> = {
   27017: 'MongoDB',
 };
 
+type CountGroup = { _count: { _all: number } };
+type WebsiteOverviewRow = {
+  id: string;
+  url: string;
+  label: string | null;
+  createdAt: Date;
+  cveScannedAt: Date | null;
+  subdomainsScannedAt: Date | null;
+};
+type LatestScanOverviewRow = {
+  websiteId: string;
+  cms: string | null;
+  category: string | null;
+  confidence: number;
+  httpStatus: number | null;
+  scannedAt: Date;
+  errorMessage: string | null;
+};
+type ScanTrendRow = { scannedAt: Date; errorMessage: string | null };
+type CveTrendRow = { scannedAt: Date };
+type AutoScanOverviewRow = {
+  intervalMinutes: number;
+  lastStartedAt: Date | null;
+  lastFinishedAt: Date | null;
+  lastStatus: string | null;
+  scannedInLastWindow: number;
+  totalAtLastWindow: number;
+};
+type BulkJobOverviewRow = {
+  id: string;
+  status: string;
+  mode: string;
+  total: number;
+  completed: number;
+  failed: number;
+  skipped: number;
+  running: number;
+  pending: number;
+  startedAt: Date | null;
+  updatedAt: Date;
+};
+type SeverityCountRow = CountGroup & { severity: string | null };
+type StatusCountRow = CountGroup & { status: string | null };
+type WebsiteCountRow = CountGroup & { websiteId: string };
+type SubdomainWebsiteCountRow = CountGroup & { websiteId: string | null };
+type DomainCountRow = CountGroup & { domain: string };
+type PortCountRow = CountGroup & { port: number };
+type AssigneeCountRow = CountGroup & { assigneeId: string | null };
+type AlertOverviewRow = { type: string; createdAt: Date };
+type ImageScanOverviewRow = {
+  websiteId: string;
+  status: string;
+  totalImages: number;
+  scannedImages: number;
+  flaggedCount: number;
+  sexualCount: number;
+  violentCount: number;
+  religiousCount: number;
+  startedAt: Date;
+  finishedAt: Date | null;
+};
+type DefacementSnapshotOverviewRow = {
+  websiteId: string;
+  domain: string;
+  url: string;
+  title: string | null;
+  status: string;
+  changeScore: number;
+  changeReasons: string[];
+  keywordHits: string[];
+  lastChangedAt: Date | null;
+  lastCheckedAt: Date;
+  website: { url: string; label: string | null } | null;
+};
+
 @Injectable()
 export class OverviewStatsService {
   constructor(private readonly prisma: PrismaService) {}
@@ -63,6 +138,11 @@ export class OverviewStatsService {
       unassignedTasks,
       cmsChanges24h,
       defacementSnapshots,
+      latestImageScans,
+      imageScansTotal,
+      imageScans24h,
+      imageScanRunning,
+      imageScanFailed24h,
     ] = await Promise.all([
       this.prisma.website.findMany({
         select: {
@@ -167,7 +247,62 @@ export class OverviewStatsService {
         },
         orderBy: [{ lastChangedAt: 'desc' }, { lastCheckedAt: 'desc' }],
       }),
-    ]);
+      this.prisma.imageScan.findMany({
+        distinct: ['websiteId'],
+        orderBy: { startedAt: 'desc' },
+        select: {
+          websiteId: true,
+          status: true,
+          totalImages: true,
+          scannedImages: true,
+          flaggedCount: true,
+          sexualCount: true,
+          violentCount: true,
+          religiousCount: true,
+          startedAt: true,
+          finishedAt: true,
+        },
+      }),
+      this.prisma.imageScan.count(),
+      this.prisma.imageScan.count({ where: { startedAt: { gte: since24h } } }),
+      this.prisma.imageScan.count({ where: { status: 'RUNNING' } }),
+      this.prisma.imageScan.count({ where: { status: 'FAILED', startedAt: { gte: since24h } } }),
+    ] as const) as unknown as [
+      WebsiteOverviewRow[],
+      LatestScanOverviewRow[],
+      ScanTrendRow[],
+      CveTrendRow[],
+      AutoScanOverviewRow | null,
+      BulkJobOverviewRow | null,
+      SeverityCountRow[],
+      StatusCountRow[],
+      WebsiteCountRow[],
+      DomainCountRow[],
+      SubdomainWebsiteCountRow[],
+      PortCountRow[],
+      WebsiteCountRow[],
+      AssigneeCountRow[],
+      AlertOverviewRow[],
+      number,
+      number,
+      number,
+      number,
+      number,
+      number,
+      number,
+      number,
+      number,
+      number,
+      number,
+      number,
+      number,
+      DefacementSnapshotOverviewRow[],
+      ImageScanOverviewRow[],
+      number,
+      number,
+      number,
+      number,
+    ];
 
     const latestByWebsite = new Map(latestRows.map(row => [row.websiteId, row]));
     const cveCountByWebsite = new Map(cveByWebsite.map(row => [row.websiteId, row._count._all]));
@@ -218,6 +353,13 @@ export class OverviewStatsService {
     const defacementSuspected = defacementSnapshots.filter(row => row.status === 'SUSPECTED').length;
     const defacementChanged = defacementSnapshots.filter(row => row.status === 'CHANGED').length;
     const defacementStable = defacementSnapshots.filter(row => row.status === 'STABLE' || row.status === 'BASELINE').length;
+    const imageModeration = this.buildImageModerationStats(latestImageScans, {
+      totalSites,
+      scansTotal: imageScansTotal,
+      scans24h: imageScans24h,
+      running: imageScanRunning,
+      failed24h: imageScanFailed24h,
+    });
 
     const topRiskSites = websites
       .map(site => {
@@ -383,6 +525,7 @@ export class OverviewStatsService {
             lastCheckedAt: row.lastCheckedAt.toISOString(),
           })),
       },
+      imageModeration,
       subdomains: {
         aliveSaved: subdomainTotal,
         deadTracked: 0,
@@ -551,6 +694,47 @@ export class OverviewStatsService {
       techniques: techniques.sort((a, b) => b.count - a.count),
       byTactic: [...byTacticMap.values()].sort((a, b) => b.count - a.count),
       monitoredSites: input.scannedSites,
+    };
+  }
+
+  private buildImageModerationStats(
+    latestScans: ImageScanOverviewRow[],
+    input: {
+      totalSites: number;
+      scansTotal: number;
+      scans24h: number;
+      running: number;
+      failed24h: number;
+    },
+  ) {
+    const totalImages = latestScans.reduce((sum, row) => sum + row.totalImages, 0);
+    const scannedImages = latestScans.reduce((sum, row) => sum + row.scannedImages, 0);
+    const flaggedImages = latestScans.reduce((sum, row) => sum + row.flaggedCount, 0);
+    const sexual = latestScans.reduce((sum, row) => sum + row.sexualCount, 0);
+    const violent = latestScans.reduce((sum, row) => sum + row.violentCount, 0);
+    const religious = latestScans.reduce((sum, row) => sum + row.religiousCount, 0);
+    const latestScanAt = latestScans.reduce<Date | null>((latest, row) => {
+      if (!latest || row.startedAt > latest) return row.startedAt;
+      return latest;
+    }, null);
+
+    return {
+      monitoredSites: latestScans.length,
+      unscannedSites: Math.max(0, input.totalSites - latestScans.length),
+      coveragePct: this.percent(latestScans.length, input.totalSites),
+      scansTotal: input.scansTotal,
+      scans24h: input.scans24h,
+      running: input.running,
+      failed24h: input.failed24h,
+      totalImages,
+      scannedImages,
+      flaggedImages,
+      cleanImages: Math.max(0, scannedImages - flaggedImages),
+      sexual,
+      violent,
+      religious,
+      flaggedPct: this.percent(flaggedImages, scannedImages),
+      latestScanAt: latestScanAt?.toISOString() || null,
     };
   }
 

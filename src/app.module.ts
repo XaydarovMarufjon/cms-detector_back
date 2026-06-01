@@ -11,6 +11,7 @@ import { CallsModule } from './calls/calls.module';
 import { LogsModule } from './logs/logs.module';
 import { AuditInterceptor } from './logs/audit.interceptor';
 import { TasksModule } from './tasks/tasks.module';
+import { ImageModerationModule } from './image-moderation/image-moderation.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { TasksModule } from './tasks/tasks.module';
     AlertsModule,
     CallsModule,
     TasksModule,
+    ImageModerationModule,
   ],
   controllers: [AppController],
   providers: [

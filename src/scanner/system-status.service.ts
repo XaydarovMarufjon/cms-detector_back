@@ -12,7 +12,7 @@ import {
   totalmem,
   uptime,
 } from 'node:os';
-import { statfsSync } from 'node:fs';
+import { readFileSync, statfsSync } from 'node:fs';
 import { PrismaService } from '../prisma/prisma.service';
 
 type PublicNetworkInfo = {
@@ -33,9 +33,16 @@ type SystemIssue = {
   at: string | null;
 };
 
+type NetworkSnapshot = {
+  rxBytes: number;
+  txBytes: number;
+  at: number;
+};
+
 @Injectable()
 export class SystemStatusService {
   private publicNetworkCache: { value: PublicNetworkInfo; expiresAt: number } | null = null;
+  private networkSnapshot: NetworkSnapshot | null = null;
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -111,6 +118,7 @@ export class SystemStatusService {
     const memoryUsed = Math.max(0, memoryTotal - memoryFree);
     const procMem = process.memoryUsage();
     const disk = this.getDiskUsage();
+    const network = this.getNetworkUsage();
 
     return {
       cpu: {
@@ -131,6 +139,7 @@ export class SystemStatusService {
         heapTotalBytes: procMem.heapTotal,
       },
       disk,
+      network,
     };
   }
 
@@ -155,6 +164,67 @@ export class SystemStatusService {
         freeBytes: 0,
         usedPct: 0,
         error: err?.message || 'disk usage unavailable',
+      };
+    }
+  }
+
+  private getNetworkUsage() {
+    const current = this.readNetworkBytes();
+    const now = Date.now();
+    const previous = this.networkSnapshot;
+    let rxBytesPerSec = 0;
+    let txBytesPerSec = 0;
+
+    if (previous && now > previous.at) {
+      const seconds = Math.max(1, (now - previous.at) / 1000);
+      rxBytesPerSec = Math.max(0, Math.round((current.rxBytes - previous.rxBytes) / seconds));
+      txBytesPerSec = Math.max(0, Math.round((current.txBytes - previous.txBytes) / seconds));
+    }
+
+    this.networkSnapshot = {
+      rxBytes: current.rxBytes,
+      txBytes: current.txBytes,
+      at: now,
+    };
+
+    return {
+      rxBytes: current.rxBytes,
+      txBytes: current.txBytes,
+      rxBytesPerSec,
+      txBytesPerSec,
+      interfaceCount: current.interfaceCount,
+      sampledAt: new Date(now).toISOString(),
+      error: current.error,
+    };
+  }
+
+  private readNetworkBytes(): { rxBytes: number; txBytes: number; interfaceCount: number; error: string | null } {
+    try {
+      const lines = readFileSync('/proc/net/dev', 'utf8').split('\n').slice(2);
+      let rxBytes = 0;
+      let txBytes = 0;
+      let interfaceCount = 0;
+
+      for (const line of lines) {
+        const [rawName, rawStats] = line.split(':');
+        const name = rawName?.trim();
+        if (!name || name === 'lo' || !rawStats) continue;
+
+        const fields = rawStats.trim().split(/\s+/).map(value => Number(value));
+        if (fields.length < 16 || fields.some(value => Number.isNaN(value))) continue;
+
+        rxBytes += fields[0] || 0;
+        txBytes += fields[8] || 0;
+        interfaceCount++;
+      }
+
+      return { rxBytes, txBytes, interfaceCount, error: null };
+    } catch (err: any) {
+      return {
+        rxBytes: 0,
+        txBytes: 0,
+        interfaceCount: 0,
+        error: err?.message || 'network usage unavailable',
       };
     }
   }
