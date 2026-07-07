@@ -232,14 +232,18 @@ export class ScannerController {
 
   @Post('websites')
   @Roles('ADMIN', 'WORKER')
-  createWebsite(@Body() body: { url: string; label?: string }) {
-    return this.prisma.website.create({ data: { url: body.url, label: body.label } });
+  async createWebsite(@Body() body: { url: string; label?: string }) {
+    const website = await this.prisma.website.create({ data: { url: body.url, label: body.label } });
+    this.subdomains.queueWebsiteDiscovery(website, 'create');
+    return website;
   }
 
   @Patch('websites/:id')
   @Roles('ADMIN', 'WORKER')
-  updateWebsite(@Param('id') id: string, @Body() body: { url?: string; label?: string }) {
-    return this.prisma.website.update({ where: { id }, data: body });
+  async updateWebsite(@Param('id') id: string, @Body() body: { url?: string; label?: string }) {
+    const website = await this.prisma.website.update({ where: { id }, data: body });
+    if (typeof body.url === 'string') this.subdomains.queueWebsiteDiscovery(website, 'url-update');
+    return website;
   }
 
   @Post('url-checker-sites')

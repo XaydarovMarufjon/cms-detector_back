@@ -1,7 +1,8 @@
 // src/scanner/subdomain.service.ts
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import axios from 'axios';
 import { execFile } from 'child_process';
+import { CronJob } from 'cron';
 import { promisify } from 'util';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -18,10 +19,43 @@ export interface SubdomainResult {
 }
 
 @Injectable()
-export class SubdomainService {
+export class SubdomainService implements OnModuleInit, OnModuleDestroy {
     private readonly logger = new Logger(SubdomainService.name);
+    private readonly autoScanEnabled = process.env.SUBDOMAIN_AUTO_SCAN_AUTO !== 'false';
+    private readonly autoScanDays = Math.max(1, Number(process.env.SUBDOMAIN_AUTO_SCAN_DAYS || 10));
+    private readonly autoScanCron = process.env.SUBDOMAIN_AUTO_SCAN_CRON || '0 30 4 * * *';
+    private readonly autoScanBatch = Math.max(1, Number(process.env.SUBDOMAIN_AUTO_SCAN_BATCH || 200));
+    private autoScanJob: CronJob | null = null;
+    private startupTimer: NodeJS.Timeout | null = null;
+    private autoScanRunning = false;
+    private queuedWebsiteIds = new Set<string>();
+    private discoveryQueue: Promise<void> = Promise.resolve();
+    private discoveryPromises = new Map<string, Promise<SubdomainResult[]>>();
 
     constructor(private readonly prisma: PrismaService) {}
+
+    onModuleInit() {
+        if (!this.autoScanEnabled) return;
+
+        this.autoScanJob = new CronJob(this.autoScanCron, () => {
+            this.runDueWebsiteScans('schedule').catch(err => {
+                this.logger.error(`Subdomain auto scan failed: ${String(err)}`);
+            });
+        });
+        this.autoScanJob.start();
+        this.startupTimer = setTimeout(() => {
+            this.runDueWebsiteScans('startup').catch(err => {
+                this.logger.error(`Subdomain startup scan failed: ${String(err)}`);
+            });
+        }, 5000);
+
+        this.logger.log(`Subdomain auto scan enabled: every ${this.autoScanDays} day(s), cron=${this.autoScanCron}`);
+    }
+
+    onModuleDestroy() {
+        this.autoScanJob?.stop();
+        if (this.startupTimer) clearTimeout(this.startupTimer);
+    }
 
     async getCachedAlive(domain: string): Promise<SubdomainResult[]> {
         const normalized = this.normalizeDomain(domain);
@@ -34,7 +68,7 @@ export class SubdomainService {
 
         return rows.map(row => ({
             subdomain: row.subdomain,
-            alive: true,
+            alive: row.statusCode !== null,
             source: row.source,
             statusCode: row.statusCode ?? undefined,
             title: row.title ?? undefined,
@@ -47,8 +81,44 @@ export class SubdomainService {
         domain = this.normalizeDomain(domain);
         if (!domain) return [];
 
-        const [crtShResult, subfinderResult] = await Promise.allSettled([
+        const results = await this.enqueueDiscovery(domain, () => this.discoverNow(domain, websiteId));
+        if (websiteId) await this.markScanCompleted(websiteId);
+        return results;
+    }
+
+    private enqueueDiscovery(domain: string, task: () => Promise<SubdomainResult[]>): Promise<SubdomainResult[]> {
+        const existing = this.discoveryPromises.get(domain);
+        if (existing) return existing;
+
+        const queued = this.discoveryQueue
+            .then(async () => {
+                this.logger.log(`Subdomain queue started: ${domain}`);
+                const startedAt = Date.now();
+                const results = await task();
+                this.logger.log(`Subdomain queue finished: ${domain}, ${results.length} result(s), ${Date.now() - startedAt}ms`);
+                return results;
+            })
+            .finally(() => {
+                this.discoveryPromises.delete(domain);
+            });
+
+        this.discoveryPromises.set(domain, queued);
+        this.discoveryQueue = queued.then(() => undefined, () => undefined);
+        return queued;
+    }
+
+    private async discoverNow(domain: string, websiteId?: string): Promise<SubdomainResult[]> {
+        const [
+            crtShResult,
+            certSpotterResult,
+            hackerTargetResult,
+            rapidDnsResult,
+            subfinderResult,
+        ] = await Promise.allSettled([
             this.fromCrtSh(domain),
+            this.fromCertSpotter(domain),
+            this.fromHackerTarget(domain),
+            this.fromRapidDns(domain),
             this.fromSubfinder(domain),
         ]);
 
@@ -63,11 +133,13 @@ export class SubdomainService {
             }
         };
 
-        if (crtShResult.status === 'fulfilled')    merge(crtShResult.value,    'crt.sh');
-        if (subfinderResult.status === 'fulfilled') merge(subfinderResult.value, 'subfinder');
+        if (crtShResult.status === 'fulfilled')         merge(crtShResult.value,         'crt.sh');
+        if (certSpotterResult.status === 'fulfilled')   merge(certSpotterResult.value,   'certspotter');
+        if (hackerTargetResult.status === 'fulfilled')  merge(hackerTargetResult.value,  'hackertarget');
+        if (rapidDnsResult.status === 'fulfilled')      merge(rapidDnsResult.value,      'rapiddns');
+        if (subfinderResult.status === 'fulfilled')     merge(subfinderResult.value,     'subfinder');
 
         if (!sourceMap.size) {
-            await this.markScanCompleted(websiteId);
             return [];
         }
 
@@ -102,8 +174,87 @@ export class SubdomainService {
         });
 
         await this.saveAlive(domain, sorted, websiteId);
-        await this.markScanCompleted(websiteId);
         return sorted;
+    }
+
+    queueWebsiteDiscovery(website: { id: string; url: string; label?: string | null }, reason = 'queued') {
+        const domain = this.normalizeDomain(website.url);
+        if (!domain || this.queuedWebsiteIds.has(website.id)) return;
+
+        this.queuedWebsiteIds.add(website.id);
+        void this.discover(domain, website.id)
+            .then(results => {
+                this.logger.log(`Subdomain ${reason} scan done for ${domain}: ${results.length} result(s)`);
+            })
+            .catch(err => {
+                this.logger.warn(`Subdomain ${reason} scan failed for ${domain}: ${String(err)}`);
+            })
+            .finally(() => {
+                this.queuedWebsiteIds.delete(website.id);
+            });
+    }
+
+    async runDueWebsiteScans(source: 'startup' | 'schedule' | 'manual' = 'manual') {
+        if (this.autoScanRunning) return { running: true, scanned: 0, due: 0 };
+        this.autoScanRunning = true;
+
+        const cutoff = new Date(Date.now() - this.autoScanDays * 24 * 60 * 60 * 1000);
+        try {
+            const due = await this.prisma.website.findMany({
+                where: {
+                    OR: [
+                        { subdomainsScannedAt: null },
+                        { subdomainsScannedAt: { lte: cutoff } },
+                    ],
+                },
+                orderBy: [
+                    { subdomainsScannedAt: 'asc' },
+                    { createdAt: 'asc' },
+                ],
+                take: this.autoScanBatch,
+            });
+
+            if (!due.length) return { running: false, scanned: 0, due: 0 };
+
+            const grouped = new Map<string, { website: typeof due[number]; ids: string[] }>();
+            for (const website of due) {
+                const domain = this.normalizeDomain(website.url);
+                if (!domain) continue;
+
+                const current = grouped.get(domain);
+                if (current) current.ids.push(website.id);
+                else grouped.set(domain, { website, ids: [website.id] });
+            }
+
+            this.logger.log(`Subdomain ${source} scan: ${due.length} due website(s), ${grouped.size} root domain(s)`);
+            let scanned = 0;
+            for (const [domain, group] of grouped) {
+                try {
+                    const results = await this.discover(domain, group.website.id);
+                    await this.markScanCompletedMany(group.ids);
+                    scanned += 1;
+                    this.logger.log(`Subdomain auto scan done for ${domain}: ${results.length} result(s)`);
+                } catch (err) {
+                    this.logger.warn(`Subdomain auto scan failed for ${domain}: ${String(err)}`);
+                }
+            }
+
+            return { running: false, scanned, due: due.length };
+        } finally {
+            this.autoScanRunning = false;
+        }
+    }
+
+    private async markScanCompletedMany(websiteIds: string[]) {
+        if (!websiteIds.length) return;
+        try {
+            await this.prisma.website.updateMany({
+                where: { id: { in: websiteIds } },
+                data: { subdomainsScannedAt: new Date() },
+            });
+        } catch (err) {
+            this.logger.warn(`subdomain scan completion save failed for group: ${String(err)}`);
+        }
     }
 
     private async markScanCompleted(websiteId?: string) {
@@ -119,14 +270,12 @@ export class SubdomainService {
     }
 
     private async saveAlive(domain: string, results: SubdomainResult[], websiteId?: string) {
-        const alive = results.filter(r => r.alive);
-
         try {
             await this.prisma.$transaction([
                 this.prisma.subdomainCache.deleteMany({ where: { domain } }),
-                ...(alive.length
+                ...(results.length
                     ? [this.prisma.subdomainCache.createMany({
-                        data: alive.map(r => ({
+                        data: results.map(r => ({
                             websiteId,
                             domain,
                             subdomain: r.subdomain,
@@ -147,22 +296,29 @@ export class SubdomainService {
         if (!raw) return '';
         try {
             const url = raw.startsWith('http') ? raw : `https://${raw}`;
-            return new URL(url).hostname.replace(/^www\./, '');
+            return this.extractRootDomain(new URL(url).hostname);
         } catch {
-            return raw
+            const host = raw
                 .replace(/^https?:\/\//, '')
                 .split('/')[0]
                 .replace(/^www\./, '');
+            return this.extractRootDomain(host);
         }
     }
 
-    // ── crt.sh certificate transparency log ──────────────────────────────────
+    private extractRootDomain(hostname: string): string {
+        const host = hostname.toLowerCase().replace(/^www\./, '');
+        const parts = host.split('.').filter(Boolean);
+        return parts.length > 2 ? parts.slice(-2).join('.') : host;
+    }
+
+    // ── passive subdomain sources ────────────────────────────────────────────
     private async fromCrtSh(domain: string): Promise<string[]> {
         try {
             const { data } = await axios.get<Array<{ name_value: string }>>(
                 `https://crt.sh/?q=%25.${encodeURIComponent(domain)}&output=json`,
                 {
-                    timeout: 30000,
+                    timeout: 12_000,
                     headers: {
                         'User-Agent': 'Mozilla/5.0 (compatible; cms-radar/1.0)',
                         'Accept': 'application/json',
@@ -173,6 +329,75 @@ export class SubdomainService {
             return data.flatMap(e => (e.name_value ?? '').split('\n'));
         } catch (err) {
             this.logger.warn(`crt.sh lookup failed for ${domain}: ${String(err)}`);
+            return [];
+        }
+    }
+
+    private async fromCertSpotter(domain: string): Promise<string[]> {
+        try {
+            const { data } = await axios.get<Array<{ dns_names?: string[] }>>(
+                `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(domain)}&include_subdomains=true&expand=dns_names`,
+                {
+                    timeout: 10_000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (compatible; cms-radar/1.0)',
+                        'Accept': 'application/json',
+                    },
+                },
+            );
+            if (!Array.isArray(data)) return [];
+            return data.flatMap(row => row.dns_names ?? []);
+        } catch (err) {
+            this.logger.warn(`certspotter lookup failed for ${domain}: ${String(err)}`);
+            return [];
+        }
+    }
+
+    private async fromHackerTarget(domain: string): Promise<string[]> {
+        try {
+            const { data } = await axios.get<string>(
+                `https://api.hackertarget.com/hostsearch/?q=${encodeURIComponent(domain)}`,
+                {
+                    timeout: 10_000,
+                    responseType: 'text',
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (compatible; cms-radar/1.0)',
+                        'Accept': 'text/plain,*/*',
+                    },
+                },
+            );
+            return String(data)
+                .split(/\r?\n/)
+                .map(line => line.split(',')[0]?.trim())
+                .filter(Boolean);
+        } catch (err) {
+            this.logger.warn(`hackertarget lookup failed for ${domain}: ${String(err)}`);
+            return [];
+        }
+    }
+
+    private async fromRapidDns(domain: string): Promise<string[]> {
+        try {
+            const { data } = await axios.get<string>(
+                `https://rapiddns.io/subdomain/${encodeURIComponent(domain)}?full=1`,
+                {
+                    timeout: 12_000,
+                    responseType: 'text',
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (compatible; cms-radar/1.0)',
+                        'Accept': 'text/html,*/*',
+                    },
+                },
+            );
+            const found = new Set<string>();
+            const escaped = domain.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const pattern = new RegExp(`(?:[a-z0-9_-]+\\.)+${escaped}`, 'gi');
+            for (const match of String(data).matchAll(pattern)) {
+                found.add(match[0].toLowerCase());
+            }
+            return [...found];
+        } catch (err) {
+            this.logger.warn(`rapiddns lookup failed for ${domain}: ${String(err)}`);
             return [];
         }
     }
