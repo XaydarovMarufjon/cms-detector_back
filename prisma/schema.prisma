@@ -321,6 +321,56 @@ model NucleiResult {
   @@map("nuclei_results")
 }
 
+model VulnerabilityWorkbook {
+  id         String               @id @default(uuid())
+  externalId String              @unique
+  name       String
+  fileName   String?
+  active     Boolean              @default(false)
+  importedAt DateTime             @default(now())
+  updatedAt  DateTime             @updatedAt
+
+  sheets VulnerabilitySheet[]
+
+  @@map("vulnerability_workbooks")
+}
+
+model VulnerabilitySheet {
+  id          String             @id @default(uuid())
+  externalId  String             @unique
+  workbookId  String
+  name        String
+  sheetIndex  Int                @default(0)
+  active      Boolean            @default(false)
+  columns     Json               @default("[]")
+  importedAt  DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  workbook VulnerabilityWorkbook @relation(fields: [workbookId], references: [id], onDelete: Cascade)
+  rows     VulnerabilityRow[]
+
+  @@index([workbookId])
+  @@map("vulnerability_sheets")
+}
+
+model VulnerabilityRow {
+  id         String             @id @default(uuid())
+  externalId String?
+  sheetId    String
+  rowIndex   Int
+  cells      Json               @default("{}")
+  styles     Json?
+  raw        Json               @default("{}")
+  importedAt DateTime           @default(now())
+  updatedAt  DateTime           @updatedAt
+
+  sheet VulnerabilitySheet @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+
+  @@index([sheetId])
+  @@index([rowIndex])
+  @@map("vulnerability_rows")
+}
+
 model PortScanResult {
   id        String   @id @default(uuid())
   websiteId String

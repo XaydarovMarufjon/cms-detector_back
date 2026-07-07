@@ -93,6 +93,8 @@ export class AuthService {
     ctx?: { ip?: string; userAgent?: string },
   ) {
     const expiresAt = new Date(Date.now() + EXTENDED_TTL_MS);
+    if (!user?.jti) return { access_token: '', expiresAt };
+
     await this.logs.extendSession(user.jti, expiresAt);
 
     const payload = { sub: user.id, username: user.username, role: user.role, jti: user.jti };

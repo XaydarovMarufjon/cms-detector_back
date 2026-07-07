@@ -1,5 +1,6 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import axios from 'axios';
+import { CronJob } from 'cron';
 import { PrismaService } from '../prisma/prisma.service';
 
 const DELAY_MS = 700; // NVD rate-limit buffer
@@ -17,17 +18,26 @@ const DEFAULT_FEEDS = [
 ] as const;
 
 @Injectable()
-export class ThreatIntelService implements OnModuleInit {
+export class ThreatIntelService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ThreatIntelService.name);
+  private readonly autoSyncEnabled = process.env.THREAT_FEED_AUTO_SYNC !== 'false';
+  private readonly autoSyncCron = process.env.THREAT_FEED_SYNC_CRON || '0 15 4 * * *';
 
   // In-memory KEV set for fast lookup
   private kevSet = new Set<string>();
   private kevLoaded = false;
+  private syncAllPromise: Promise<Record<string, { synced: number; errors: number }>> | null = null;
+  private syncJob: CronJob | null = null;
 
   constructor(private readonly prisma: PrismaService) {}
 
   async onModuleInit() {
     await this.seedDefaultFeeds();
+    this.startAutoSyncJob();
+  }
+
+  onModuleDestroy() {
+    this.syncJob?.stop();
   }
 
   private async seedDefaultFeeds() {
@@ -44,6 +54,14 @@ export class ThreatIntelService implements OnModuleInit {
 
   async getFeeds() {
     return this.prisma.threatFeed.findMany({ orderBy: { createdAt: 'asc' } });
+  }
+
+  getSyncConfig() {
+    return {
+      autoEnabled: this.autoSyncEnabled,
+      cron: this.autoSyncCron,
+      scheduleLabel: this.describeCron(this.autoSyncCron),
+    };
   }
 
   async upsertFeed(data: {
@@ -143,6 +161,16 @@ export class ThreatIntelService implements OnModuleInit {
   }
 
   async syncAllFeeds() {
+    if (this.syncAllPromise) return this.syncAllPromise;
+    this.syncAllPromise = this.runSyncAllFeeds();
+    try {
+      return await this.syncAllPromise;
+    } finally {
+      this.syncAllPromise = null;
+    }
+  }
+
+  private async runSyncAllFeeds() {
     const feeds = await this.prisma.threatFeed.findMany({ where: { enabled: true } });
     const results: Record<string, { synced: number; errors: number }> = {};
     for (const feed of feeds) {
@@ -151,6 +179,40 @@ export class ThreatIntelService implements OnModuleInit {
       } catch { results[feed.id] = { synced: 0, errors: 1 }; }
     }
     return results;
+  }
+
+  private startAutoSyncJob() {
+    if (!this.autoSyncEnabled) {
+      this.logger.log('Threat feed auto-sync disabled');
+      return;
+    }
+
+    this.syncJob = new CronJob(this.autoSyncCron, () => {
+      this.logger.log(`Threat feed auto-sync started: ${this.autoSyncCron}`);
+      this.syncAllFeeds()
+        .then(results => {
+          const entries = Object.values(results);
+          const synced = entries.reduce((sum, r) => sum + r.synced, 0);
+          const errors = entries.reduce((sum, r) => sum + r.errors, 0);
+          this.logger.log(`Threat feed auto-sync finished: synced=${synced}, errors=${errors}`);
+        })
+        .catch(err => {
+          const message = err instanceof Error ? err.message : String(err);
+          this.logger.error(`Threat feed auto-sync failed: ${message}`);
+        });
+    });
+    this.syncJob.start();
+    this.logger.log(`Threat feed auto-sync enabled: ${this.autoSyncCron}`);
+  }
+
+  private describeCron(expr: string) {
+    const parts = expr.trim().split(/\s+/);
+    if (parts.length !== 6) return 'Custom cron';
+    const [sec, min, hour, day, month, dow] = parts;
+    if (sec === '0' && day === '*' && month === '*' && dow === '*') {
+      return `Har kuni ${hour.padStart(2, '0')}:${min.padStart(2, '0')}`;
+    }
+    return 'Custom cron';
   }
 
   // ── ENRICH CVE ────────────────────────────────────────────────────────────

@@ -1149,26 +1149,48 @@ export class ScannerService implements OnModuleInit {
 
   // ── LATEST RESULTS ────────────────────────────────────────────────────────
   async getLatestResults() {
-    const rows = await this.prisma.scanResult.findMany({
-      distinct: ['websiteId'],
-      orderBy: { scannedAt: 'desc' },
+    const websites = await this.prisma.website.findMany({
+      orderBy: { createdAt: 'desc' },
       include: {
-        website: {
-          include: {
-            _count: { select: { nucleiResults: true } },
-          },
+        _count: { select: { nucleiResults: true } },
+        scans: {
+          orderBy: { scannedAt: 'desc' },
+          take: 1,
         },
       },
     });
 
-    return rows.map(row => {
-      const { _count, ...website } = row.website;
+    return websites.map(row => {
+      const { _count, scans, ...website } = row;
+      const latest = scans[0];
+      const enrichedWebsite = {
+        ...website,
+        cveFindingsCount: _count.nucleiResults,
+      };
+
+      if (!latest) {
+        return {
+          id: `unscanned:${website.id}`,
+          websiteId: website.id,
+          cms: null,
+          version: null,
+          category: null,
+          confidence: 0,
+          detectionMethods: [],
+          serverTech: [],
+          jsFrameworks: [],
+          rawSignals: {},
+          httpStatus: null,
+          pageTitle: null,
+          scannedAt: null,
+          errorMessage: null,
+          website: enrichedWebsite,
+        };
+      }
+
       return {
-        ...row,
-        website: {
-          ...website,
-          cveFindingsCount: _count.nucleiResults,
-        },
+        ...latest,
+        website: enrichedWebsite,
       };
     });
   }

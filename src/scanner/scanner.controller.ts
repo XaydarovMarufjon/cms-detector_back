@@ -337,6 +337,9 @@ export class ScannerController {
   }
 
   // ── Threat Intel Feeds ───────────────────────────────────────────────────
+  @Get('threat-feeds/sync-config')
+  getFeedSyncConfig() { return this.threatIntel.getSyncConfig(); }
+
   @Get('threat-feeds')
   getFeeds() { return this.threatIntel.getFeeds(); }
 

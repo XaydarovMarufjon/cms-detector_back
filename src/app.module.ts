@@ -12,6 +12,7 @@ import { LogsModule } from './logs/logs.module';
 import { AuditInterceptor } from './logs/audit.interceptor';
 import { TasksModule } from './tasks/tasks.module';
 import { ImageModerationModule } from './image-moderation/image-moderation.module';
+import { VulnerabilitiesModule } from './vulnerabilities/vulnerabilities.module';
 
 @Module({
   imports: [
@@ -24,6 +25,7 @@ import { ImageModerationModule } from './image-moderation/image-moderation.modul
     CallsModule,
     TasksModule,
     ImageModerationModule,
+    VulnerabilitiesModule,
   ],
   controllers: [AppController],
   providers: [

@@ -178,48 +178,31 @@ export class NucleiService {
         targetsByWebsite,
       );
       const hits = this.mergeHits([...nucleiHits, ...passiveHits]);
-
-      // Group hits by websiteId
-      const byWebsite = new Map<string, NucleiHit[]>();
-      for (const hit of hits) {
+      const resolveWebsiteId = (hit: NucleiHit): string | null => {
         const match =
           urlMap.get(hit.subdomain) ??
           urlMap.get(`https://${hit.subdomain}`) ??
           urlMap.get(`http://${hit.subdomain}`);
-        const websiteId = hit.websiteId ?? match?.id;
+        return hit.websiteId ?? match?.id ?? null;
+      };
+
+      // Group hits by websiteId
+      const byWebsite = new Map<string, NucleiHit[]>();
+      for (const hit of hits) {
+        const websiteId = resolveWebsiteId(hit);
         if (!websiteId) continue;
         if (!byWebsite.has(websiteId)) byWebsite.set(websiteId, []);
         byWebsite.get(websiteId)!.push(hit);
       }
 
       // Save to DB
-      if (hits.length) {
-        await this.prisma.$transaction(
-          hits.map(h => {
-            const match =
-              urlMap.get(h.subdomain) ??
-              urlMap.get(`https://${h.subdomain}`) ??
-              urlMap.get(`http://${h.subdomain}`);
-            const websiteId = h.websiteId ?? match?.id ?? websites[0].id;
-            return this.prisma.nucleiResult.create({
-              data: {
-                websiteId,
-                subdomain:   h.subdomain,
-                templateId:  h.templateId,
-                cveId:       h.cveId,
-                severity:    h.severity,
-                name:        h.name,
-                description: h.description,
-                matchedAt:   h.matchedAt,
-                source:      h.source ?? 'NUCLEI',
-                confidence:  h.confidence ?? 95,
-                referenceUrl: h.referenceUrl ?? null,
-                evidence:    h.evidence ?? {},
-              },
-            });
-          }),
-        );
-      }
+      const rows = hits
+        .map(h => {
+          const websiteId = resolveWebsiteId(h);
+          return websiteId ? this.toNucleiCreateRow(h, websiteId) : null;
+        })
+        .filter((row): row is ReturnType<NucleiService['toNucleiCreateRow']> => !!row);
+      if (rows.length) await this.prisma.nucleiResult.createMany({ data: rows });
 
       // Build completed list
       for (const site of websites) {
@@ -240,8 +223,8 @@ export class NucleiService {
         this.enrichCvesBackground(cveIds);
       }
 
-      this.logger.log(`Nuclei scan-all done: ${websites.length} sites, ${hits.length} findings`);
-      return { total: websites.length, findings: hits.length };
+      this.logger.log(`Nuclei scan-all done: ${websites.length} sites, ${rows.length} findings`);
+      return { total: websites.length, findings: rows.length };
     } catch (e) {
       this.logger.error(`Nuclei scan-all failed: ${String(e)}`);
       throw e;
@@ -317,26 +300,9 @@ export class NucleiService {
     }
 
     if (hits.length) {
-      await this.prisma.$transaction(
-        hits.map(h =>
-          this.prisma.nucleiResult.create({
-            data: {
-              websiteId,
-              subdomain:   h.subdomain,
-              templateId:  h.templateId,
-              cveId:       h.cveId,
-              severity:    h.severity,
-              name:        h.name,
-              description: h.description,
-              matchedAt:   h.matchedAt,
-              source:      h.source ?? 'NUCLEI',
-              confidence:  h.confidence ?? 95,
-              referenceUrl: h.referenceUrl ?? null,
-              evidence:    h.evidence ?? {},
-            },
-          }),
-        ),
-      );
+      await this.prisma.nucleiResult.createMany({
+        data: hits.map(h => this.toNucleiCreateRow(h, websiteId)),
+      });
     }
     await this.markCveScanCompleted(websiteId);
 
@@ -389,6 +355,23 @@ export class NucleiService {
       (a, b) =>
         (SEVERITY_ORDER[a.severity] ?? 5) - (SEVERITY_ORDER[b.severity] ?? 5),
     );
+  }
+
+  private toNucleiCreateRow(h: NucleiHit, websiteId: string) {
+    return {
+      websiteId,
+      subdomain:   h.subdomain,
+      templateId:  h.templateId,
+      cveId:       h.cveId,
+      severity:    h.severity,
+      name:        h.name,
+      description: h.description,
+      matchedAt:   h.matchedAt,
+      source:      h.source ?? 'NUCLEI',
+      confidence:  h.confidence ?? 95,
+      referenceUrl: h.referenceUrl ?? null,
+      evidence:    h.evidence ?? {},
+    };
   }
 
   // ── NUCLEI BINARY ─────────────────────────────────────────────────────────
