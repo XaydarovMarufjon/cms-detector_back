@@ -5,6 +5,7 @@ import { execFile } from 'child_process';
 import { CronJob } from 'cron';
 import { promisify } from 'util';
 import { PrismaService } from '../prisma/prisma.service';
+import { NucleiService } from './nuclei.service';
 
 const execFileAsync = promisify(execFile);
 
@@ -25,6 +26,7 @@ export class SubdomainService implements OnModuleInit, OnModuleDestroy {
     private readonly autoScanDays = Math.max(1, Number(process.env.SUBDOMAIN_AUTO_SCAN_DAYS || 10));
     private readonly autoScanCron = process.env.SUBDOMAIN_AUTO_SCAN_CRON || '0 30 4 * * *';
     private readonly autoScanBatch = Math.max(1, Number(process.env.SUBDOMAIN_AUTO_SCAN_BATCH || 200));
+    private readonly autoNucleiEnabled = process.env.SUBDOMAIN_NUCLEI_AUTO_SCAN !== 'false';
     private autoScanJob: CronJob | null = null;
     private startupTimer: NodeJS.Timeout | null = null;
     private autoScanRunning = false;
@@ -32,7 +34,10 @@ export class SubdomainService implements OnModuleInit, OnModuleDestroy {
     private discoveryQueue: Promise<void> = Promise.resolve();
     private discoveryPromises = new Map<string, Promise<SubdomainResult[]>>();
 
-    constructor(private readonly prisma: PrismaService) {}
+    constructor(
+        private readonly prisma: PrismaService,
+        private readonly nuclei: NucleiService,
+    ) {}
 
     onModuleInit() {
         if (!this.autoScanEnabled) return;
@@ -174,7 +179,18 @@ export class SubdomainService implements OnModuleInit, OnModuleDestroy {
         });
 
         await this.saveAlive(domain, sorted, websiteId);
+        this.queueNucleiForAliveSubdomains(domain, sorted, websiteId);
         return sorted;
+    }
+
+    private queueNucleiForAliveSubdomains(domain: string, results: SubdomainResult[], websiteId?: string) {
+        if (!this.autoNucleiEnabled || !websiteId) return;
+
+        const alive = results
+            .filter(r => r.alive)
+            .map(r => r.subdomain);
+
+        this.nuclei.queueSubdomainScan(websiteId, domain, alive, 'subdomain-discovery');
     }
 
     queueWebsiteDiscovery(website: { id: string; url: string; label?: string | null }, reason = 'queued') {

@@ -2687,6 +2687,7 @@ export class CmsDetectorService implements OnModuleInit {
                 ...(bare
                     ? {}
                     : { httpAgent: proxyAgent ?? this.httpAgent, httpsAgent: proxyAgent ?? this.httpsAgent }),
+                proxy: false,
                 headers: {
                     'User-Agent': this.randomUserAgent(),
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',

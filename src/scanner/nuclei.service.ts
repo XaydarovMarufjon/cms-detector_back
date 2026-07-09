@@ -60,6 +60,8 @@ export class NucleiService {
   private readonly logger = new Logger(NucleiService.name);
   private nucleiInterval = 1440; // daqiqa (default: 24 soat)
   private scanningAll = false;
+  private subdomainScanQueue: Promise<void> = Promise.resolve();
+  private queuedSubdomainScans = new Set<string>();
 
   private progress: NucleiScanProgress = {
     scanning: false, currentSite: null, currentIndex: 0,
@@ -313,6 +315,89 @@ export class NucleiService {
     return hits;
   }
 
+  queueSubdomainScan(
+    websiteId: string,
+    rootDomain: string,
+    subdomains: string[],
+    reason = 'subdomain-discovery',
+  ) {
+    const hosts = this.normalizeHosts(subdomains);
+    const domain = this.normalizeHost(rootDomain);
+    const key = `${websiteId}:${domain || hosts.join(',')}`;
+    if (!websiteId || this.queuedSubdomainScans.has(key)) return;
+
+    this.queuedSubdomainScans.add(key);
+    const job = this.subdomainScanQueue
+      .then(async () => {
+        const hits = await this.scanSubdomainTargets(websiteId, hosts, domain);
+        this.logger.log(`Nuclei ${reason} scan done for ${domain || websiteId}: ${hosts.length} alive subdomain(s), ${hits.length} finding(s)`);
+      })
+      .catch(err => {
+        this.logger.warn(`Nuclei ${reason} scan failed for ${domain || websiteId}: ${String(err)}`);
+      })
+      .finally(() => {
+        this.queuedSubdomainScans.delete(key);
+      });
+
+    this.subdomainScanQueue = job.then(() => undefined, () => undefined);
+  }
+
+  async scanSubdomainTargets(
+    websiteId: string,
+    subdomains: string[],
+    rootDomain?: string,
+  ): Promise<NucleiHit[]> {
+    const hosts = this.normalizeHosts(subdomains);
+    const domain = rootDomain ? this.normalizeHost(rootDomain) : '';
+
+    await this.clearSubdomainResults(websiteId, hosts, domain);
+    if (!hosts.length) {
+      await this.markCveScanCompleted(websiteId);
+      return [];
+    }
+
+    const targets = this.expandTargets(hosts);
+
+    let nucleiHits: NucleiHit[] = [];
+    try {
+      nucleiHits = await this.runNuclei(targets);
+    } catch (err) {
+      this.logger.warn(`Nuclei active subdomain scan failed for ${websiteId}, passive CVE lookup will continue: ${String(err)}`);
+    }
+
+    const passiveHits = await this.cveCorrelation.correlateWebsite(websiteId, targets);
+    const targetHosts = new Set(hosts);
+    const hits = this.mergeHits([...nucleiHits, ...passiveHits])
+      .filter(hit => targetHosts.has(this.normalizeHost(hit.subdomain)));
+
+    if (hits.length) {
+      await this.prisma.nucleiResult.createMany({
+        data: hits.map(h => this.toNucleiCreateRow(h, websiteId)),
+      });
+    }
+    await this.markCveScanCompleted(websiteId);
+
+    const cveIds = [...new Set(hits.map(h => h.cveId).filter(Boolean))] as string[];
+    if (cveIds.length) this.enrichCvesBackground(cveIds);
+
+    return hits;
+  }
+
+  private async clearSubdomainResults(websiteId: string, subdomains: string[], rootDomain: string) {
+    const hosts = this.normalizeHosts(subdomains);
+    const or: Array<{ subdomain: { in: string[] } } | { subdomain: { endsWith: string } }> = [];
+    if (hosts.length) or.push({ subdomain: { in: hosts } });
+    if (rootDomain) or.push({ subdomain: { endsWith: `.${rootDomain}` } });
+    if (!or.length) return;
+
+    await this.prisma.nucleiResult.deleteMany({
+      where: {
+        websiteId,
+        OR: or,
+      },
+    });
+  }
+
   private async markCveScanCompleted(websiteId: string) {
     try {
       await this.prisma.website.update({
@@ -485,6 +570,21 @@ export class NucleiService {
   private extractHost(url: string): string {
     try   { return new URL(url).hostname; }
     catch { return url.replace(/^https?:\/\//, '').split('/')[0]; }
+  }
+
+  private normalizeHost(value: string): string {
+    return this.extractHost(value || '')
+      .toLowerCase()
+      .replace(/^www\./, '')
+      .trim();
+  }
+
+  private normalizeHosts(values: string[]): string[] {
+    return [...new Set(
+      values
+        .map(value => this.normalizeHost(value))
+        .filter(Boolean),
+    )];
   }
 
   private normalizeTargets(targets: string[]): string[] {

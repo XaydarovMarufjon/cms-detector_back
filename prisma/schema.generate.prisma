@@ -271,9 +271,13 @@ model Alert {
   message     String
   dueDate     DateTime
   dismissed   Boolean  @default(false)
+  falsePositive Boolean @default(false)
+  falsePositiveUntil DateTime?
   createdAt   DateTime @default(now())
 
   @@unique([domain, type])
+  @@index([falsePositive])
+  @@index([falsePositiveUntil])
   @@map("alerts")
 }
 

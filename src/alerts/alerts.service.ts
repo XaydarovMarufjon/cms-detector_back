@@ -34,6 +34,8 @@ function resolveLabel(days: number): string {
   return `${days} kun qoldi`;
 }
 
+const FALSE_POSITIVE_TTL_MS = 24 * 60 * 60 * 1000;
+
 @Injectable()
 export class AlertsService {
   constructor(private prisma: PrismaService) {}
@@ -92,28 +94,96 @@ export class AlertsService {
     domain: string; type: string; message: string;
     dueDate: Date; websiteId?: string;
   }) {
-    await this.prisma.alert.upsert({
-      where:  { domain_type: { domain: data.domain, type: data.type } },
-      update: { message: data.message, dueDate: data.dueDate, dismissed: false, websiteId: data.websiteId ?? null },
-      create: { domain: data.domain, type: data.type, message: data.message, dueDate: data.dueDate, dismissed: false, websiteId: data.websiteId ?? null },
+    await this.deleteExpiredFalsePositives();
+
+    const where = { domain_type: { domain: data.domain, type: data.type } };
+    const existing = await this.prisma.alert.findUnique({ where });
+
+    if (existing) {
+      if (existing.falsePositive) return;
+
+      await this.prisma.alert.update({
+        where,
+        data: {
+          message: data.message,
+          dueDate: data.dueDate,
+          dismissed: false,
+          websiteId: data.websiteId ?? null,
+        },
+      });
+      return;
+    }
+
+    await this.prisma.alert.create({
+      data: {
+        domain: data.domain,
+        type: data.type,
+        message: data.message,
+        dueDate: data.dueDate,
+        dismissed: false,
+        falsePositive: false,
+        falsePositiveUntil: null,
+        websiteId: data.websiteId ?? null,
+      },
     });
   }
 
-  getAll() {
+  async getAll() {
+    await this.deleteExpiredFalsePositives();
     return this.prisma.alert.findMany({
-      where:   { dismissed: false },
+      where:   { dismissed: false, falsePositive: false },
       orderBy: { dueDate: 'asc' },
     });
   }
 
-  getCount() {
-    return this.prisma.alert.count({ where: { dismissed: false } });
+  async getCount() {
+    await this.deleteExpiredFalsePositives();
+    return this.prisma.alert.count({ where: { dismissed: false, falsePositive: false } });
+  }
+
+  async getFalsePositive() {
+    await this.deleteExpiredFalsePositives();
+    return this.prisma.alert.findMany({
+      where:   { falsePositive: true },
+      orderBy: { dueDate: 'desc' },
+    });
   }
 
   async dismiss(id: string) {
     return this.prisma.alert.update({
       where: { id },
       data:  { dismissed: true },
+    });
+  }
+
+  async markFalsePositive(id: string) {
+    return this.prisma.alert.update({
+      where: { id },
+      data:  {
+        dismissed: true,
+        falsePositive: true,
+        falsePositiveUntil: this.falsePositiveUntil(),
+      },
+    });
+  }
+
+  async restore(id: string) {
+    return this.prisma.alert.update({
+      where: { id },
+      data:  { dismissed: false, falsePositive: false, falsePositiveUntil: null },
+    });
+  }
+
+  private falsePositiveUntil(): Date {
+    return new Date(Date.now() + FALSE_POSITIVE_TTL_MS);
+  }
+
+  private async deleteExpiredFalsePositives() {
+    await this.prisma.alert.deleteMany({
+      where: {
+        falsePositive: true,
+        falsePositiveUntil: { lte: new Date() },
+      },
     });
   }
 }

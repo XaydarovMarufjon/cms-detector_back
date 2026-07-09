@@ -12,10 +12,19 @@ export class AlertsController {
   @Get()
   getAll() { return this.alerts.getAll(); }
 
+  @Get('false-positive')
+  getFalsePositive() { return this.alerts.getFalsePositive(); }
+
   @Public()
   @Get('count')
   getCount() { return this.alerts.getCount().then(count => ({ count })); }
 
   @Patch(':id/dismiss')
   dismiss(@Param('id') id: string) { return this.alerts.dismiss(id); }
+
+  @Patch(':id/false-positive')
+  markFalsePositive(@Param('id') id: string) { return this.alerts.markFalsePositive(id); }
+
+  @Patch(':id/restore')
+  restore(@Param('id') id: string) { return this.alerts.restore(id); }
 }
