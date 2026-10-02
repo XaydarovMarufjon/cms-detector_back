@@ -21,8 +21,8 @@ export function deviceFromUa(userAgent?: string | null): string | null {
   const ua = userAgent.toLowerCase();
   const os =
     ua.includes('windows') ? 'Windows' :
-    ua.includes('mac os') || ua.includes('macintosh') ? 'macOS' :
     ua.includes('iphone') || ua.includes('ipad') ? 'iOS' :
+    ua.includes('mac os') || ua.includes('macintosh') ? 'macOS' :
     ua.includes('android') ? 'Android' :
     ua.includes('linux') ? 'Linux' :
     'Unknown';
