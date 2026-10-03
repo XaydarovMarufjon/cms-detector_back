@@ -828,12 +828,13 @@ export class OverviewStatsService {
   private days(from: Date, to: Date, dates: Date[]) {
     const buckets: Array<{ date: string; count: number }> = [];
     const cursor = new Date(from);
-    cursor.setHours(0, 0, 0, 0);
+    // Bucket boundaries must use UTC, just like the ISO date keys below.
+    cursor.setUTCHours(0, 0, 0, 0);
     const end = new Date(to);
-    end.setHours(0, 0, 0, 0);
+    end.setUTCHours(0, 0, 0, 0);
     while (cursor <= end) {
       buckets.push({ date: cursor.toISOString().slice(0, 10), count: 0 });
-      cursor.setDate(cursor.getDate() + 1);
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
     }
     const index = new Map(buckets.map((row, i) => [row.date, i]));
     for (const date of dates) {
