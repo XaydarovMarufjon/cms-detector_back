@@ -48,7 +48,7 @@ export class TasksService {
         description: input.description?.trim() || null,
         source: this.cleanSource(input.source),
         priority: this.cleanPriority(input.priority),
-        dueDate: input.dueDate ? new Date(input.dueDate) : null,
+        dueDate: this.cleanDueDate(input.dueDate),
         websiteId: input.websiteId || null,
         assigneeId: input.assigneeId || null,
         createdById: createdById || null,
@@ -69,7 +69,8 @@ export class TasksService {
     if (input.source !== undefined) data['source'] = this.cleanSource(input.source);
     if (input.priority !== undefined) data['priority'] = this.cleanPriority(input.priority);
     if (input.status !== undefined) data['status'] = this.cleanStatus(input.status);
-    if (input.dueDate !== undefined) data['dueDate'] = input.dueDate ? new Date(input.dueDate) : null;
+    if (input.dueDate !== undefined)
+      data['dueDate'] = this.cleanDueDate(input.dueDate);
     if (input.websiteId !== undefined) data['websiteId'] = input.websiteId || null;
     if (input.assigneeId !== undefined) data['assigneeId'] = input.assigneeId || null;
 
@@ -90,6 +91,19 @@ export class TasksService {
       assignee: { select: { id: true, username: true, role: true } },
       createdBy: { select: { id: true, username: true, role: true } },
     };
+  }
+
+  private cleanDueDate(value: unknown): Date | null {
+    if (value === undefined || value === null || value === '') return null;
+    if (typeof value !== 'string') {
+      throw new BadRequestException("dueDate noto'g'ri sana formati");
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      throw new BadRequestException("dueDate noto'g'ri sana formati");
+    }
+    return date;
   }
 
   private cleanPriority(priority?: string): string {
