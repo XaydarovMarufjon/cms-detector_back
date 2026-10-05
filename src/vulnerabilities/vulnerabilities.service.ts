@@ -232,13 +232,14 @@ export class VulnerabilitiesService {
   }
 
   private normalizeSheets(payload: unknown): NormalizedSheet[] {
-    if (!payload || typeof payload !== 'object') {
-      throw new BadRequestException('Payload noto‘g‘ri');
-    }
+    this.validateRecord(payload, 'Payload');
     const data = payload as SyncPayload;
-    if (!Array.isArray(data.sheets)) return [];
+    if (!Array.isArray(data.sheets)) {
+      throw new BadRequestException('sheets ro‘yxati kerak');
+    }
 
     return data.sheets.map((sheet, sheetIndex) => {
+      this.validateRecord(sheet, 'Sheet');
       const columns = this.normalizeColumns(sheet.columns);
       const workbookId = this.cleanString(sheet.workbookId) || 'default-workbook';
       const externalId = this.cleanString(sheet.id) || `${workbookId}-sheet-${sheetIndex + 1}`;
@@ -256,18 +257,30 @@ export class VulnerabilitiesService {
   }
 
   private normalizeColumns(columns: SyncColumn[] | undefined): NormalizedColumn[] {
-    if (!Array.isArray(columns)) return [];
-    return columns.map((column, index) => ({
-      id: this.cleanString(column?.id) || `col_${index + 1}`,
-      label: this.cleanString(column?.label) || `Ustun ${index + 1}`,
-      width: this.clamp(Math.round(Number(column?.width) || 160), 48, 1200),
-    }));
+    if (columns === undefined) return [];
+    if (!Array.isArray(columns)) {
+      throw new BadRequestException('columns ro‘yxati noto‘g‘ri');
+    }
+    return columns.map((column, index) => {
+      this.validateRecord(column, 'Column');
+      return {
+        id: this.cleanString(column.id) || `col_${index + 1}`,
+        label: this.cleanString(column.label) || `Ustun ${index + 1}`,
+        width: this.clamp(Math.round(Number(column.width) || 160), 48, 1200),
+      };
+    });
   }
 
   private normalizeRows(rows: SyncRow[] | undefined, columns: NormalizedColumn[]): NormalizedRow[] {
-    if (!Array.isArray(rows)) return [];
+    if (rows === undefined) return [];
+    if (!Array.isArray(rows)) {
+      throw new BadRequestException('rows ro‘yxati noto‘g‘ri');
+    }
     return rows
       .map((row, index) => {
+        this.validateRecord(row, 'Row');
+        if (row.cells !== undefined) this.validateRecord(row.cells, 'Cells');
+        if (row.styles != null) this.validateRecord(row.styles, 'Styles');
         const cells = this.normalizeCells(row?.cells, columns);
         return {
           externalId: this.cleanString(row?.id) || null,
@@ -280,6 +293,12 @@ export class VulnerabilitiesService {
         };
       })
       .filter(row => Object.values(row.cells).some(value => value.trim()));
+  }
+
+  private validateRecord(value: unknown, name: string): void {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new BadRequestException(`${name} noto‘g‘ri`);
+    }
   }
 
   private normalizeCells(input: unknown, columns: NormalizedColumn[]): Record<string, string> {
