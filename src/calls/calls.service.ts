@@ -131,7 +131,10 @@ export class CallsService implements OnModuleInit {
     if (f.from || f.to) {
       const gte = f.from ? new Date(f.from + 'T00:00:00') : new Date(0);
       const toDate = f.to ? new Date(f.to + 'T00:00:00') : new Date();
-      const lt = new Date(toDate.getTime() + 86_400_000);
+      const lt = new Date(toDate.getTime());
+      // An inclusive local date ends at the next midnight, even on DST days.
+      if (f.to) lt.setDate(lt.getDate() + 1);
+      else lt.setTime(lt.getTime() + 86_400_000);
       return { gte, lt };
     }
     return null;
