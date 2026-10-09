@@ -25,6 +25,10 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## API notes
+
+- [Vulnerability exports: repeated column labels](docs/vulnerability-exports.md)
+
 ## Project setup
 
 ```bash
