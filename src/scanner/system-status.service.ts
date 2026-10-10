@@ -275,7 +275,7 @@ export class SystemStatusService {
         this.prisma.auditLog.count({ where: { createdAt: { gte: since24h } } }),
         this.prisma.auditLog.count({ where: { createdAt: { gte: since24h }, action: { contains: 'error' } } }),
         this.prisma.auditLog.count({ where: { createdAt: { gte: since24h }, action: 'auth.login.fail' } }),
-        this.prisma.securityTask.count({ where: { status: { notIn: ['DONE', 'CLOSED', 'RESOLVED'] } } }),
+        this.prisma.securityTask.count({ where: { status: { in: ['OPEN', 'IN_PROGRESS'] } } }),
         this.prisma.autoScanState.findUnique({ where: { key: 'cms-auto-scan' } }),
         this.prisma.auditLog.findMany({
           where: { action: { contains: 'error' } },
