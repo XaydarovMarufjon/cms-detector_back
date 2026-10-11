@@ -91,6 +91,7 @@ export class ImageModerationService {
     const scan = await this.prisma.imageScan.create({
       data: { websiteId, status: 'RUNNING' },
     });
+    let sexual = 0, violent = 0, religious = 0, flagged = 0, processed = 0;
 
     try {
       const images = await this.crawler.extractSiteImages(url, {
@@ -114,8 +115,6 @@ export class ImageModerationService {
         where: { id: scan.id },
         data: { totalImages: images.length },
       });
-
-      let sexual = 0, violent = 0, religious = 0, flagged = 0, processed = 0;
 
       for (const image of images) {
         const verdict = await this.sight.checkImage(image.imageUrl);
@@ -144,7 +143,13 @@ export class ImageModerationService {
         if (processed % 5 === 0) {
           await this.prisma.imageScan.update({
             where: { id: scan.id },
-            data: { scannedImages: processed, flaggedCount: flagged },
+            data: {
+              scannedImages: processed,
+              flaggedCount: flagged,
+              sexualCount: sexual,
+              violentCount: violent,
+              religiousCount: religious,
+            },
           });
         }
 
@@ -167,7 +172,16 @@ export class ImageModerationService {
       const message = e instanceof Error ? e.message : 'Unknown error';
       return this.prisma.imageScan.update({
         where: { id: scan.id },
-        data: { status: 'FAILED', errorMessage: message, finishedAt: new Date() },
+        data: {
+          status: 'FAILED',
+          errorMessage: message,
+          scannedImages: processed,
+          flaggedCount: flagged,
+          sexualCount: sexual,
+          violentCount: violent,
+          religiousCount: religious,
+          finishedAt: new Date(),
+        },
       });
     }
   }
