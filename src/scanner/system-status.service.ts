@@ -175,17 +175,20 @@ export class SystemStatusService {
     let rxBytesPerSec = 0;
     let txBytesPerSec = 0;
 
-    if (previous && now > previous.at) {
+    if (!current.error && previous && now > previous.at) {
       const seconds = Math.max(1, (now - previous.at) / 1000);
       rxBytesPerSec = Math.max(0, Math.round((current.rxBytes - previous.rxBytes) / seconds));
       txBytesPerSec = Math.max(0, Math.round((current.txBytes - previous.txBytes) / seconds));
     }
 
-    this.networkSnapshot = {
-      rxBytes: current.rxBytes,
-      txBytes: current.txBytes,
-      at: now,
-    };
+    // Failed reads return placeholder zeros, not a new counter baseline.
+    if (!current.error) {
+      this.networkSnapshot = {
+        rxBytes: current.rxBytes,
+        txBytes: current.txBytes,
+        at: now,
+      };
+    }
 
     return {
       rxBytes: current.rxBytes,
