@@ -149,6 +149,9 @@ export class CallsService implements OnModuleInit {
 
     let createdAt: Date | undefined;
     if (data.createdAt !== undefined) {
+      if (typeof data.createdAt !== 'string') {
+        throw new BadRequestException("createdAt noto'g'ri sana formati");
+      }
       const d = new Date(data.createdAt);
       if (isNaN(d.getTime())) throw new BadRequestException('createdAt noto\'g\'ri sana formati');
       createdAt = d;
