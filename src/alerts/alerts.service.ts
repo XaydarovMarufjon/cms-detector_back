@@ -11,7 +11,19 @@ function parseWhoisDate(s: string): Date | null {
   if (m) {
     const mon = MONTHS[m[2].toLowerCase()];
     if (mon === undefined) return null;
-    return new Date(+m[3], mon, +m[1]);
+    const year = +m[3];
+    const day = +m[1];
+    const date = new Date(0);
+    date.setFullYear(year, mon, day);
+    date.setHours(0, 0, 0, 0);
+    if (
+      date.getFullYear() !== year ||
+      date.getMonth() !== mon ||
+      date.getDate() !== day
+    ) {
+      return null;
+    }
+    return date;
   }
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d;
