@@ -124,8 +124,16 @@ export class CallsService implements OnModuleInit {
       if (!m) return null;
       const year = +m[1];
       const month = +m[2] - 1;
-      const gte = new Date(year, month, 1);
-      const lt = new Date(year, month + 1, 1);
+      if (month < 0 || month > 11) {
+        throw new BadRequestException("month noto'g'ri oy formati");
+      }
+      // setFullYear preserves literal years 0000–0099 instead of adding 1900.
+      const gte = new Date(0);
+      gte.setFullYear(year, month, 1);
+      gte.setHours(0, 0, 0, 0);
+      const lt = new Date(gte.getTime());
+      lt.setFullYear(year, month + 1, 1);
+      lt.setHours(0, 0, 0, 0);
       return { gte, lt };
     }
     if (f.from || f.to) {
