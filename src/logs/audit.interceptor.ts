@@ -67,11 +67,45 @@ export class AuditInterceptor implements NestInterceptor {
       .replace(/\.$/, '') || 'request';
   }
 
-  private maskBody(body: any) {
+  private maskBody(body: unknown): unknown {
     if (!body || typeof body !== 'object') return body;
-    const clone = { ...body };
-    for (const key of Object.keys(clone)) {
-      if (/password|token|secret|apiKey/i.test(key)) clone[key] = '[redacted]';
+    const makeCopy = (source: object): object =>
+      source instanceof Date
+        ? new Date(source.getTime())
+        : Array.isArray(source)
+          ? new Array<unknown>(source.length)
+          : {};
+    const clone = makeCopy(body);
+    const copies = new WeakMap<object, object>([[body, clone]]);
+    const pending: [object, object][] = [[body, clone]];
+
+    // Walk iteratively so deeply nested JSON cannot exhaust the call stack.
+    while (pending.length) {
+      const [source, target] = pending.pop()!;
+      for (const [key, value] of Object.entries(source) as [
+        string,
+        unknown,
+      ][]) {
+        let masked = value;
+        if (/password|token|secret|apiKey/i.test(key)) {
+          masked = '[redacted]';
+        } else if (value && typeof value === 'object') {
+          let copy = copies.get(value);
+          if (!copy) {
+            copy = makeCopy(value);
+            copies.set(value, copy);
+            pending.push([value, copy]);
+          }
+          masked = copy;
+        }
+        // An own __proto__ JSON key must remain data, not a prototype setter.
+        Object.defineProperty(target, key, {
+          value: masked,
+          enumerable: true,
+          configurable: true,
+          writable: true,
+        });
+      }
     }
     return clone;
   }
